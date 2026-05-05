@@ -11,6 +11,7 @@
 
 import { EventEmitter } from 'events'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
+import { StreamableHTTPError } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import {
   connectToRemoteServer,
   log,
@@ -24,6 +25,7 @@ import {
 import { StaticOAuthClientInformationFull, StaticOAuthClientMetadata } from './lib/types'
 import { NodeOAuthClientProvider } from './lib/node-oauth-client-provider'
 import { createLazyAuthCoordinator } from './lib/coordination'
+import { ReconnectionManager } from './lib/reconnection-manager'
 
 /**
  * Main function to run the proxy
@@ -106,14 +108,64 @@ async function runProxy(
   }
 
   try {
-    // Connect to remote server with lazy authentication
-    const remoteTransport = await connectToRemoteServer(null, serverUrl, authProvider, headers, authInitializer, transportStrategy)
+    // Connect to remote server with lazy authentication.
+    // Retry transient errors (500/502/503/504/network) so that startup
+    // survives backend pods still booting.
+    let remoteTransport = await (async () => {
+      const maxStartupRetries = 10
+      const retryDelayMs = 3000
+      for (let attempt = 1; ; attempt++) {
+        try {
+          return await connectToRemoteServer(null, serverUrl, authProvider, headers, authInitializer, transportStrategy)
+        } catch (err: any) {
+          const code = err instanceof StreamableHTTPError ? err.code : undefined
+          const isTransient =
+            (typeof code === 'number' && code >= 500) ||
+            err.message?.includes('ECONNREFUSED') ||
+            err.message?.includes('fetch failed') ||
+            err.message?.includes('Connection refused')
+
+          if (!isTransient || attempt >= maxStartupRetries) throw err
+          log(`Initial connection attempt ${attempt} failed (${String(code ?? err.message)}), retrying in ${retryDelayMs / 1000}s...`)
+          await new Promise((r) => setTimeout(r, retryDelayMs))
+        }
+      }
+    })()
+
+    // Set up reconnection manager for seamless server restarts.
+    // Retries indefinitely — survives hours-long outages (e.g. weekend maintenance).
+    const reconnectionManager = new ReconnectionManager({
+      reconnectFn: async () => {
+        log('Reconnecting to remote server...')
+        return connectToRemoteServer(null, serverUrl, authProvider, headers, authInitializer, transportStrategy, new Set(), true)
+      },
+      onTransportReplaced: (newTransport) => {
+        remoteTransport = newTransport
+        log('Server transport replaced successfully')
+      },
+      onMessagePurged: (message) => {
+        if (message.id) {
+          log(`Sending error response for purged request ${message.id} (${message.method})`)
+          localTransport
+            .send({
+              jsonrpc: '2.0',
+              id: message.id,
+              error: {
+                code: -32603,
+                message: 'Server temporarily unavailable, please retry',
+              },
+            })
+            .catch((err: Error) => log('Failed to send purge error response:', err.message))
+        }
+      },
+    })
 
     // Set up bidirectional proxy between local and remote transports
     mcpProxy({
       transportToClient: localTransport,
       transportToServer: remoteTransport,
       ignoredTools,
+      reconnectionManager,
     })
 
     // Start the local STDIO server

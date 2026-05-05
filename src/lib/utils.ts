@@ -14,6 +14,7 @@ import {
   type ProtectedResourceMetadata,
 } from './protected-resource-metadata'
 import { fetchAuthorizationServerMetadata, type AuthorizationServerMetadata } from './authorization-server-metadata'
+import { ReconnectionManager } from './reconnection-manager'
 import express from 'express'
 import net from 'net'
 import crypto from 'crypto'
@@ -124,21 +125,42 @@ export function createMessageTransformer({
   }
 }
 
+function isReconnectableError(error: Error): boolean {
+  if (error instanceof StreamableHTTPError) {
+    const code = error.code
+    return code === 400 || code === 404 || code === 500 || code === 502 || code === 503 || code === 504
+  }
+  const msg = error.message?.toLowerCase() ?? ''
+  return (
+    msg.includes('connection refused') ||
+    msg.includes('econnrefused') ||
+    msg.includes('econnreset') ||
+    msg.includes('socket hang up') ||
+    msg.includes('network') ||
+    msg.includes('fetch failed') ||
+    msg.includes('sse stream disconnected')
+  )
+}
+
 /**
- * Creates a bidirectional proxy between two transports
- * @param params The transport connections to proxy between
+ * Creates a bidirectional proxy between two transports.
+ * When a reconnectionManager is provided, server transport disconnections trigger
+ * automatic reconnection instead of killing the STDIO pipe to the client.
  */
 export function mcpProxy({
   transportToClient,
   transportToServer,
   ignoredTools = [],
+  reconnectionManager,
 }: {
   transportToClient: Transport
   transportToServer: Transport
   ignoredTools?: string[]
+  reconnectionManager?: ReconnectionManager
 }) {
   let transportToClientClosed = false
   let transportToServerClosed = false
+  let currentServerTransport = transportToServer
 
   const messageTransformer = createMessageTransformer({
     transformRequestFunction: (request: Message) => {
@@ -176,11 +198,70 @@ export function mcpProxy({
     },
   })
 
+  function wireServerTransportHandlers(serverTransport: Transport) {
+    serverTransport.onmessage = (_message) => {
+      if (reconnectionManager && reconnectionManager.isSyntheticInitResponse(_message as any)) {
+        log('[Remote→Local] (suppressed synthetic init response)', (_message as any).id)
+        return
+      }
+
+      const message = messageTransformer.interceptResponse(_message as any)
+      log('[Remote→Local]', message.method || message.id)
+
+      debugLog('Remote → Local message', {
+        method: message.method,
+        id: message.id,
+        result: message.result ? 'result-present' : undefined,
+        error: message.error,
+      })
+
+      transportToClient.send(message).catch(onClientError)
+    }
+
+    serverTransport.onclose = () => {
+      if (transportToClientClosed) {
+        return
+      }
+
+      if (reconnectionManager) {
+        debugLog('Remote transport closed, triggering reconnection')
+        transportToServerClosed = true
+        reconnectionManager.triggerReconnection('server transport closed').catch(onServerError)
+        return
+      }
+
+      transportToServerClosed = true
+      debugLog('Remote transport closed, closing local transport')
+      transportToClient.close().catch(onClientError)
+    }
+
+    serverTransport.onerror = (error: Error) => {
+      log('Error from remote server:', error)
+      debugLog('Error from remote server', { stack: error.stack })
+
+      if (reconnectionManager && !reconnectionManager.isReconnecting()) {
+        if (isReconnectableError(error)) {
+          const code = error instanceof StreamableHTTPError ? error.code : 'unknown'
+          debugLog('Reconnectable error detected, triggering reconnection', { code, message: error.message })
+          transportToServerClosed = true
+          reconnectionManager.triggerReconnection(`onerror (${code}): ${error.message}`).catch(onServerError)
+        }
+      }
+    }
+  }
+
+  if (reconnectionManager) {
+    reconnectionManager.onTransportSwapped((newTransport: Transport) => {
+      currentServerTransport = newTransport
+      transportToServerClosed = false
+      wireServerTransportHandlers(newTransport)
+      debugLog('Server transport replaced after reconnection')
+    })
+  }
+
   transportToClient.onmessage = (_message) => {
-    // TODO: fix types
     const message = messageTransformer.interceptRequest(_message as any)
 
-    // If interceptor returns MESSAGE_BLOCKED, don't forward the message
     if (isMessageBlocked(message)) {
       return
     }
@@ -197,26 +278,43 @@ export function mcpProxy({
       const { clientInfo } = message.params
       if (clientInfo) clientInfo.name = `${clientInfo.name} (via mcp-remote ${MCP_REMOTE_VERSION})`
       log(JSON.stringify(message, null, 2))
-
       debugLog('Initialize message with modified client info', { clientInfo })
+
+      if (reconnectionManager) {
+        reconnectionManager.captureInitialize(message)
+      }
     }
 
-    transportToServer.send(message).catch(onServerError)
-  }
+    if (reconnectionManager && reconnectionManager.isReconnecting()) {
+      if (!message.id) {
+        log(`Dropping notification during reconnection (${message.method})`)
+        return
+      }
+      debugLog('Queueing message during reconnection', { method: message.method, id: message.id })
+      reconnectionManager.queueMessage(message).catch(onServerError)
+      return
+    }
 
-  transportToServer.onmessage = (_message) => {
-    // TODO: fix types
-    const message = messageTransformer.interceptResponse(_message as any)
-    log('[Remote→Local]', message.method || message.id)
+    currentServerTransport.send(message).catch((error: Error) => {
+      if (reconnectionManager && !reconnectionManager.isReconnecting()) {
+        const isReconnectable = isReconnectableError(error)
 
-    debugLog('Remote → Local message', {
-      method: message.method,
-      id: message.id,
-      result: message.result ? 'result-present' : undefined,
-      error: message.error,
+        if (isReconnectable) {
+          const code = error instanceof StreamableHTTPError ? error.code : 'unknown'
+          const isNotification = !message.id
+          if (isNotification) {
+            log(`Notification send failed during server outage (${message.method}), dropping`)
+            reconnectionManager.triggerReconnection(`send failed (${code}): ${error.message}`).catch(onServerError)
+            return
+          }
+          debugLog('Send failed with reconnectable error, triggering reconnection and queueing', { code, message: error.message })
+          reconnectionManager.triggerReconnection(`send failed (${code}): ${error.message}`).catch(onServerError)
+          reconnectionManager.queueMessage(message).catch(onServerError)
+          return
+        }
+      }
+      onServerError(error)
     })
-
-    transportToClient.send(message).catch(onClientError)
   }
 
   transportToClient.onclose = () => {
@@ -226,20 +324,13 @@ export function mcpProxy({
 
     transportToClientClosed = true
     debugLog('Local transport closed, closing remote transport')
-    transportToServer.close().catch(onServerError)
-  }
-
-  transportToServer.onclose = () => {
-    if (transportToClientClosed) {
-      return
-    }
-    transportToServerClosed = true
-    debugLog('Remote transport closed, closing local transport')
-    transportToClient.close().catch(onClientError)
+    currentServerTransport.close().catch(onServerError)
   }
 
   transportToClient.onerror = onClientError
-  transportToServer.onerror = onServerError
+
+  // Wire up initial server transport handlers
+  wireServerTransportHandlers(currentServerTransport)
 
   function onClientError(error: Error) {
     log('Error from local client:', error)
@@ -395,6 +486,7 @@ export async function connectToRemoteServer(
   authInitializer: AuthInitializer,
   transportStrategy: TransportStrategy = 'http-first',
   recursionReasons: Set<string> = new Set(),
+  skipBrowserAuth: boolean = false,
 ): Promise<Transport> {
   log(`[${pid}] Connecting to remote server: ${serverUrl}`)
   const url = new URL(serverUrl)
@@ -498,8 +590,14 @@ export async function connectToRemoteServer(
         authInitializer,
         sseTransport ? 'http-only' : 'sse-only',
         recursionReasons,
+        skipBrowserAuth,
       )
     } else if (error instanceof UnauthorizedError || (error instanceof Error && error.message.includes('Unauthorized'))) {
+      if (skipBrowserAuth) {
+        log('Authentication required during reconnection, but browser auth is disabled. Will retry.')
+        throw new Error(`Authentication required during reconnection: ${error.message}`)
+      }
+
       log('Authentication required. Initializing auth...')
       debugLog('Authentication error detected', {
         errorCode: error instanceof OAuthError ? error.errorCode : undefined,
@@ -509,9 +607,9 @@ export async function connectToRemoteServer(
 
       // Initialize authentication on-demand
       debugLog('Calling authInitializer to start auth flow')
-      const { waitForAuthCode, skipBrowserAuth } = await authInitializer()
+      const { waitForAuthCode, skipBrowserAuth: sharedAuth } = await authInitializer()
 
-      if (skipBrowserAuth) {
+      if (sharedAuth) {
         log('Authentication required but skipping browser auth - using shared auth')
       } else {
         log('Authentication required. Waiting for authorization...')
@@ -542,7 +640,7 @@ export async function connectToRemoteServer(
         debugLog('Recursively reconnecting after auth', { recursionReasons: Array.from(recursionReasons) })
 
         // Recursively call connectToRemoteServer with the updated recursion tracking
-        return connectToRemoteServer(client, serverUrl, authProvider, headers, authInitializer, transportStrategy, recursionReasons)
+        return connectToRemoteServer(client, serverUrl, authProvider, headers, authInitializer, transportStrategy, recursionReasons, skipBrowserAuth)
       } catch (authError: any) {
         log('Authorization error:', authError)
         debugLog('Authorization error during finishAuth', {
@@ -571,7 +669,7 @@ export async function connectToRemoteServer(
           if (!recursionReasons.has(REASON_INVALID_GRANT)) {
             recursionReasons.add(REASON_INVALID_GRANT)
             log('Retrying with fresh authentication...')
-            return connectToRemoteServer(client, serverUrl, authProvider, headers, authInitializer, transportStrategy, recursionReasons)
+            return connectToRemoteServer(client, serverUrl, authProvider, headers, authInitializer, transportStrategy, recursionReasons, skipBrowserAuth)
           }
         }
 
