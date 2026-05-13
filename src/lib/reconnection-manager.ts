@@ -1,7 +1,7 @@
 import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import { log, debugLog } from './utils'
 
-export type ReconnectionState = 'connected' | 'reconnecting' | 'waiting'
+export type ReconnectionState = 'connected' | 'reconnecting' | 'waiting' | 'auth-failed'
 
 export interface ReconnectionConfig {
   initialDelayMs: number
@@ -10,6 +10,13 @@ export interface ReconnectionConfig {
   maxRetriesBeforeWaiting: number
   waitingRetryIntervalMs: number
   maxMessageAgeMs: number
+  // After this many consecutive auth-related reconnect failures, give up
+  // and transition to the terminal `auth-failed` state. This prevents a
+  // silent infinite loop when an admin has truly revoked the user (the
+  // refresh_token is invalid, the access_token won't refresh, and we'd
+  // otherwise keep retrying every 5 min forever without ever surfacing
+  // a clear message). Set to 0 to retry indefinitely.
+  maxAuthFailuresBeforeGiveUp: number
 }
 
 export const DEFAULT_RECONNECTION_CONFIG: ReconnectionConfig = {
@@ -19,6 +26,22 @@ export const DEFAULT_RECONNECTION_CONFIG: ReconnectionConfig = {
   maxRetriesBeforeWaiting: 10,
   waitingRetryIntervalMs: 5 * 60 * 1000,
   maxMessageAgeMs: 30 * 1000,
+  maxAuthFailuresBeforeGiveUp: 5,
+}
+
+function isAuthError(err: unknown): boolean {
+  if (!err) return false
+  const e = err as { message?: string; errorCode?: string; status?: number }
+  const msg = (e.message || '').toLowerCase()
+  return (
+    e.status === 401 ||
+    e.status === 403 ||
+    e.errorCode === 'invalid_grant' ||
+    msg.includes('unauthorized') ||
+    msg.includes('invalid_grant') ||
+    msg.includes('authentication required') ||
+    msg.includes('invalid_token')
+  )
 }
 
 type JSONRPCMessage = any
@@ -40,6 +63,7 @@ export class ReconnectionManager {
   private capturedInitMessage: JSONRPCMessage | null = null
   private pendingInitId: string | null = null
   private retryCount = 0
+  private consecutiveAuthFailures = 0
   private reconnecting = false
   private transportSwappedListeners: Array<(transport: Transport) => void> = []
 
@@ -149,6 +173,7 @@ export class ReconnectionManager {
         this.state = 'connected'
         this.reconnecting = false
         this.retryCount = 0
+        this.consecutiveAuthFailures = 0
         for (const listener of this.transportSwappedListeners) {
           listener(newTransport)
         }
@@ -163,6 +188,37 @@ export class ReconnectionManager {
           attempt: this.retryCount,
           error: error instanceof Error ? error.stack : String(error),
         })
+
+        // Track auth-specific failures separately. A 401/403/invalid_grant
+        // means the credentials are bad — retrying with the same bad
+        // credentials forever just churns silently. After
+        // maxAuthFailuresBeforeGiveUp consecutive auth errors, surface a
+        // clear terminal message and stop retrying.
+        if (isAuthError(error)) {
+          this.consecutiveAuthFailures++
+          debugLog('Auth-related reconnection failure', {
+            consecutiveAuthFailures: this.consecutiveAuthFailures,
+            limit: this.config.maxAuthFailuresBeforeGiveUp,
+          })
+          if (
+            this.config.maxAuthFailuresBeforeGiveUp > 0 &&
+            this.consecutiveAuthFailures >= this.config.maxAuthFailuresBeforeGiveUp
+          ) {
+            this.state = 'auth-failed'
+            this.reconnecting = false
+            log(
+              `Authentication has permanently failed after ${this.consecutiveAuthFailures} attempts. ` +
+                `Your access has likely been revoked, or your refresh token expired. ` +
+                `To recover: quit Claude Desktop, delete %USERPROFILE%\\.mcp-auth\\ (on Windows) or ~/.mcp-auth/ (on macOS/Linux), and restart Claude Desktop to re-authenticate.`,
+            )
+            this.purgeStaleMessages()
+            return
+          }
+        } else {
+          // Reset on non-auth failure so a single auth blip doesn't poison
+          // the counter when intermixed with network blips.
+          this.consecutiveAuthFailures = 0
+        }
       }
     }
   }

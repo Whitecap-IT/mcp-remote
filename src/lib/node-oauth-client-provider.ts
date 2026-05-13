@@ -1,4 +1,5 @@
 import open from 'open'
+import { z } from 'zod'
 import { OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js'
 import {
   OAuthClientInformationFull,
@@ -14,6 +15,17 @@ import { sanitizeUrl } from 'strict-url-sanitise'
 import { randomUUID } from 'node:crypto'
 import { fetchAuthorizationServerMetadata, type AuthorizationServerMetadata } from './authorization-server-metadata'
 import type { ProtectedResourceMetadata } from './protected-resource-metadata'
+
+// Extend the SDK's OAuthTokensSchema with `expires_at` — the absolute
+// expiration timestamp that saveTokens() writes. The SDK's schema uses
+// `.strip()` so any unknown keys are silently dropped on read; without
+// this extension, tokens() falls through to the legacy `expires_in`
+// branch even though we persisted `expires_at`. That bug made the
+// proactive-refresh path effectively unreachable across process restarts.
+const StoredOAuthTokensSchema = OAuthTokensSchema.extend({
+  expires_at: z.number().optional(),
+})
+type StoredOAuthTokens = z.infer<typeof StoredOAuthTokensSchema>
 
 /**
  * Implements the OAuthClientProvider interface for Node.js environments.
@@ -46,7 +58,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   // races) so we can keep operating with valid in-memory tokens instead of
   // throwing back to the SDK and triggering a fresh OAuth flow. Includes the
   // computed expires_at so tokens() can decide whether to refresh.
-  private inMemoryTokens: (OAuthTokens & { expires_at?: number }) | null = null
+  private inMemoryTokens: StoredOAuthTokens | null = null
 
   // Per-process suppression of repeat browser opens. The SDK can call
   // redirectToAuthorization() many times in quick succession when something
@@ -284,11 +296,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
         // token out from under us. Re-read what they persisted and try
         // once more before surfacing this as an auth failure.
         log('Refresh got invalid_grant; checking if another process rotated the token...')
-        const fresh = await readJsonFile<OAuthTokens & { expires_at?: number }>(
-          this.serverUrlHash,
-          'tokens.json',
-          OAuthTokensSchema,
-        )
+        const fresh = await readJsonFile<StoredOAuthTokens>(this.serverUrlHash, 'tokens.json', StoredOAuthTokensSchema)
         if (fresh?.refresh_token && fresh.refresh_token !== refreshToken) {
           debugLog('Disk has a newer refresh_token; retrying once with it')
           return this.doTokenRefresh(fresh.refresh_token, /*allowReread=*/ false)
@@ -333,7 +341,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     debugLog('Token request stack trace:', new Error().stack)
 
     // Read tokens with extended schema that includes expires_at
-    let tokens = await readJsonFile<OAuthTokens & { expires_at?: number }>(this.serverUrlHash, 'tokens.json', OAuthTokensSchema)
+    let tokens = await readJsonFile<StoredOAuthTokens>(this.serverUrlHash, 'tokens.json', StoredOAuthTokensSchema)
 
     // If the on-disk tokens are stale (older expires_at) but we have fresher
     // tokens in memory from a save that didn't persist to disk, prefer the
@@ -437,11 +445,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
         // saveTokens() writes both expires_in and a freshly computed expires_at.
         // Re-read so the caller sees the persisted form (with expires_at) rather
         // than the raw token-endpoint response (which only has expires_in).
-        const persisted = await readJsonFile<OAuthTokens & { expires_at?: number }>(
-          this.serverUrlHash,
-          'tokens.json',
-          OAuthTokensSchema,
-        )
+        const persisted = await readJsonFile<StoredOAuthTokens>(this.serverUrlHash, 'tokens.json', StoredOAuthTokensSchema)
         return persisted ?? refreshed
       }
       // Refresh skipped (no metadata / no client info) - return stale tokens.

@@ -2,6 +2,7 @@ import path from 'path'
 import os from 'os'
 import fs from 'fs/promises'
 import { randomUUID } from 'crypto'
+import lockfile from 'proper-lockfile'
 import { log, MCP_REMOTE_VERSION } from './utils'
 
 /**
@@ -156,6 +157,34 @@ export async function readJsonFile<T>(serverUrlHash: string, filename: string, s
 }
 
 /**
+ * Acquires a cross-process advisory lock on a config file (or its parent
+ * config dir, if the target doesn't exist yet). Used by writeJsonFile to
+ * serialize concurrent writers on Windows, where `fs.rename` can fail
+ * with EPERM when another process holds an open handle on the target.
+ *
+ * Returns an `unlock` function. Callers must invoke it in a `finally`
+ * block; if the call throws (lock unavailable), no unlock is necessary.
+ */
+async function acquireConfigLock(filePath: string): Promise<() => Promise<void>> {
+  // `proper-lockfile` creates a sibling directory `<filePath>.lock`. If
+  // the target file doesn't exist yet (first write), lock the parent
+  // config dir instead so we still serialize across writers.
+  let lockTarget = filePath
+  try {
+    await fs.access(filePath)
+  } catch {
+    // Target doesn't exist; fall back to the parent dir, which is
+    // guaranteed to exist because ensureConfigDir() ran before this.
+    lockTarget = path.dirname(filePath)
+  }
+  return lockfile.lock(lockTarget, {
+    retries: { retries: 10, factor: 1.5, minTimeout: 50, maxTimeout: 1000 },
+    stale: 30_000,
+    realpath: false,
+  })
+}
+
+/**
  * Writes a JSON object to a file atomically using temp file + rename pattern.
  * This prevents race conditions where multiple processes might read partially-written files.
  * The rename operation is atomic on POSIX systems.
@@ -168,30 +197,53 @@ export async function writeJsonFile(serverUrlHash: string, filename: string, dat
     await ensureConfigDir()
     const filePath = getConfigFilePath(serverUrlHash, filename)
 
-    // Use atomic write pattern: write to a unique temp file, then rename.
-    // The suffix uses crypto.randomUUID() rather than `${pid}.${Date.now()}`
-    // because two callers in the same Node process can hit this function
-    // within the same millisecond (concurrent OAuth flows after an SSE
-    // reconnect), and `pid+Date.now()` collides — the second caller's
-    // rename either sees ENOENT (target moved by the first) or EPERM
-    // (cleanup race), the error bubbles up to saveTokens, and an auth
-    // cascade is triggered that opens dozens of browser tabs.
-    const tempPath = `${filePath}.${randomUUID()}.tmp`
+    // Cross-process advisory lock. On Windows, two mcp-remote subprocesses
+    // (which Claude Desktop sometimes spawns) racing each other's
+    // fs.rename can produce EPERM. The lock serializes them so each gets
+    // a clean atomic write. The lock is short-lived (single write op).
+    let unlock: (() => Promise<void>) | null = null
+    try {
+      unlock = await acquireConfigLock(filePath)
+    } catch (lockErr) {
+      // If we can't get the lock in time, fall through and try the write
+      // anyway. The UUID temp suffix still prevents intra-process races;
+      // we'd just be at the mercy of the rename for cross-process. C2's
+      // non-fatal save catches any leftover failure.
+      log(`Could not acquire lock for ${filename}; proceeding without it:`, lockErr)
+    }
 
     try {
-      // Write to temporary file first
-      await fs.writeFile(tempPath, JSON.stringify(data, null, 2), { encoding: 'utf-8', mode: 0o600 })
+      // Use atomic write pattern: write to a unique temp file, then rename.
+      // The suffix uses crypto.randomUUID() rather than `${pid}.${Date.now()}`
+      // because two callers in the same Node process can hit this function
+      // within the same millisecond (concurrent OAuth flows after an SSE
+      // reconnect), and `pid+Date.now()` collides.
+      const tempPath = `${filePath}.${randomUUID()}.tmp`
 
-      // Atomic rename (on POSIX systems)
-      await fs.rename(tempPath, filePath)
-    } catch (writeError) {
-      // Clean up temp file if it exists
       try {
-        await fs.unlink(tempPath)
-      } catch {
-        // Ignore cleanup errors
+        // Write to temporary file first
+        await fs.writeFile(tempPath, JSON.stringify(data, null, 2), { encoding: 'utf-8', mode: 0o600 })
+
+        // Atomic rename (on POSIX systems; on Windows, may fail with EPERM
+        // under contention if a peer holds a handle — the surrounding
+        // lock and the saveTokens non-fatal-catch both mitigate that).
+        await fs.rename(tempPath, filePath)
+      } catch (writeError) {
+        // Clean up temp file if it exists
+        try {
+          await fs.unlink(tempPath)
+        } catch {
+          // Ignore cleanup errors
+        }
+        throw writeError
       }
-      throw writeError
+    } finally {
+      if (unlock) {
+        await unlock().catch(() => {
+          // proper-lockfile throws if the lock was compromised; we don't
+          // care at this point because we're done writing.
+        })
+      }
     }
   } catch (error) {
     log(`Error writing ${filename}:`, error)
