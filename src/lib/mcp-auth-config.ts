@@ -1,6 +1,7 @@
 import path from 'path'
 import os from 'os'
 import fs from 'fs/promises'
+import { randomUUID } from 'crypto'
 import { log, MCP_REMOTE_VERSION } from './utils'
 
 /**
@@ -167,9 +168,15 @@ export async function writeJsonFile(serverUrlHash: string, filename: string, dat
     await ensureConfigDir()
     const filePath = getConfigFilePath(serverUrlHash, filename)
 
-    // Use atomic write pattern: write to temp file, then rename
-    // This prevents other processes from reading partially-written files
-    const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`
+    // Use atomic write pattern: write to a unique temp file, then rename.
+    // The suffix uses crypto.randomUUID() rather than `${pid}.${Date.now()}`
+    // because two callers in the same Node process can hit this function
+    // within the same millisecond (concurrent OAuth flows after an SSE
+    // reconnect), and `pid+Date.now()` collides — the second caller's
+    // rename either sees ENOENT (target moved by the first) or EPERM
+    // (cleanup race), the error bubbles up to saveTokens, and an auth
+    // cascade is triggered that opens dozens of browser tabs.
+    const tempPath = `${filePath}.${randomUUID()}.tmp`
 
     try {
       // Write to temporary file first

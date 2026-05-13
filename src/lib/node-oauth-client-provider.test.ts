@@ -302,4 +302,67 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
       expect(clientMetadata.scope).toBe('openid email profile')
     })
   })
+
+  describe('storm resistance (C1/C2/C5)', () => {
+    it('saveTokens does not throw when disk write fails', async () => {
+      provider = new NodeOAuthClientProvider(defaultOptions)
+      mockWriteJsonFile.mockRejectedValueOnce(new Error('EPERM: rename failed'))
+
+      // Should resolve successfully — the in-memory tokens are valid even
+      // if persistence failed. Pre-fix this would throw and trigger the
+      // SDK's fresh-OAuth cascade.
+      await expect(
+        provider.saveTokens({
+          access_token: 'at-1',
+          token_type: 'Bearer',
+          refresh_token: 'rt-1',
+          expires_in: 7200,
+        }),
+      ).resolves.toBeUndefined()
+    })
+
+    it('tokens() returns the in-memory copy if it is fresher than disk', async () => {
+      provider = new NodeOAuthClientProvider(defaultOptions)
+
+      // Disk has an old token; simulate the case where the most recent
+      // saveTokens persisted to memory but failed to flush to disk.
+      const oldExpiresAt = Date.now() - 60_000 // already expired
+      const newExpiresAt = Date.now() + 7_200_000 // 2h from now
+      mockReadJsonFile.mockResolvedValue({
+        access_token: 'old',
+        token_type: 'Bearer',
+        refresh_token: 'rt-old',
+        expires_in: 7200,
+        expires_at: oldExpiresAt,
+      })
+
+      // Make disk write fail so the in-memory cache is the only fresh copy.
+      mockWriteJsonFile.mockRejectedValueOnce(new Error('EPERM'))
+      await provider.saveTokens({
+        access_token: 'new',
+        token_type: 'Bearer',
+        refresh_token: 'rt-new',
+        expires_in: 7200,
+      })
+
+      const got = await provider.tokens()
+      expect(got?.access_token).toBe('new')
+    })
+
+    it('redirectToAuthorization suppresses repeat browser opens inside the cooldown', async () => {
+      const openMod = await import('open')
+      const openMock = vi.mocked(openMod.default)
+      openMock.mockClear()
+
+      provider = new NodeOAuthClientProvider(defaultOptions)
+      const url = new URL('https://idp.example.com/auth?x=1')
+
+      await provider.redirectToAuthorization(url)
+      await provider.redirectToAuthorization(url)
+      await provider.redirectToAuthorization(url)
+
+      // Pre-fix: open() was called 3 times. Post-fix: only once.
+      expect(openMock).toHaveBeenCalledTimes(1)
+    })
+  })
 })

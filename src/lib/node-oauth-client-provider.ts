@@ -41,6 +41,23 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   // refresh-token-rotation problems with strict providers).
   private refreshPromise: Promise<OAuthTokens | undefined> | null = null
 
+  // Hot cache of the most recently issued tokens. Used as a fallback when
+  // disk persistence fails (Windows file locks, antivirus, cross-process
+  // races) so we can keep operating with valid in-memory tokens instead of
+  // throwing back to the SDK and triggering a fresh OAuth flow. Includes the
+  // computed expires_at so tokens() can decide whether to refresh.
+  private inMemoryTokens: (OAuthTokens & { expires_at?: number }) | null = null
+
+  // Per-process suppression of repeat browser opens. The SDK can call
+  // redirectToAuthorization() many times in quick succession when something
+  // else in the auth pipeline keeps failing (e.g. a Windows token-write race
+  // that throws → SDK treats as auth failure → restart auth). Without this
+  // guard, every retry opens a fresh tab — the "SSO storm" the user sees.
+  // We allow one open per BROWSER_OPEN_COOLDOWN_MS; subsequent calls just log
+  // the URL so a human can paste it if needed but don't spawn a tab.
+  private static readonly BROWSER_OPEN_COOLDOWN_MS = 30_000
+  private lastBrowserOpenAt = 0
+
   // Refresh the access_token when it has this many ms left. 60 seconds gives
   // plenty of buffer to round-trip the refresh exchange before the SDK uses it.
   private static readonly REFRESH_BUFFER_MS = 60_000
@@ -204,8 +221,22 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
    * failure (4xx/5xx) this throws so the caller can decide whether to fall
    * back to the stale tokens (5xx, transient) or surface the error (4xx,
    * usually invalid_grant requiring fresh user auth).
+   *
+   * Special-case: providers like Keycloak rotate the refresh_token on every
+   * use AND reject the previous one. If two mcp-remote processes start at
+   * the same moment (which Claude Desktop sometimes does), both read the
+   * same refresh_token from disk, both POST /token, and the second sees
+   * `invalid_grant`. Before bubbling that up (which would trigger a fresh
+   * OAuth flow in the SDK), we re-read tokens.json — the first process has
+   * almost certainly just persisted the rotated refresh_token — and retry
+   * once with the fresh value. If THAT also fails, the refresh token is
+   * genuinely invalid and we surface the error.
    */
   private async performTokenRefresh(refreshToken: string): Promise<OAuthTokens | undefined> {
+    return this.doTokenRefresh(refreshToken, /*allowReread=*/ true)
+  }
+
+  private async doTokenRefresh(refreshToken: string, allowReread: boolean): Promise<OAuthTokens | undefined> {
     const meta = await this.getAuthorizationServerMetadata()
     if (!meta?.token_endpoint) {
       debugLog('Cannot refresh: authorization server metadata has no token_endpoint')
@@ -235,6 +266,25 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
 
     if (!response.ok) {
       const text = await response.text().catch(() => '')
+      const isInvalidGrant = response.status === 400 && text.includes('invalid_grant')
+
+      if (isInvalidGrant && allowReread) {
+        // Another mcp-remote process probably just rotated the refresh
+        // token out from under us. Re-read what they persisted and try
+        // once more before surfacing this as an auth failure.
+        log('Refresh got invalid_grant; checking if another process rotated the token...')
+        const fresh = await readJsonFile<OAuthTokens & { expires_at?: number }>(
+          this.serverUrlHash,
+          'tokens.json',
+          OAuthTokensSchema,
+        )
+        if (fresh?.refresh_token && fresh.refresh_token !== refreshToken) {
+          debugLog('Disk has a newer refresh_token; retrying once with it')
+          return this.doTokenRefresh(fresh.refresh_token, /*allowReread=*/ false)
+        }
+        debugLog('Disk refresh_token unchanged; invalid_grant is real')
+      }
+
       // Tag 4xx vs 5xx so the caller can decide how to react.
       const err = new Error(`Token refresh failed: HTTP ${response.status} ${text}`) as Error & {
         status: number
@@ -272,7 +322,23 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     debugLog('Token request stack trace:', new Error().stack)
 
     // Read tokens with extended schema that includes expires_at
-    const tokens = await readJsonFile<OAuthTokens & { expires_at?: number }>(this.serverUrlHash, 'tokens.json', OAuthTokensSchema)
+    let tokens = await readJsonFile<OAuthTokens & { expires_at?: number }>(this.serverUrlHash, 'tokens.json', OAuthTokensSchema)
+
+    // If the on-disk tokens are stale (older expires_at) but we have fresher
+    // tokens in memory from a save that didn't persist to disk, prefer the
+    // in-memory copy. This keeps things working when disk persistence is
+    // intermittent (Windows concurrent processes, AV scanners, etc.).
+    if (this.inMemoryTokens) {
+      const diskExpiresAt = tokens?.expires_at ?? 0
+      const memExpiresAt = this.inMemoryTokens.expires_at ?? 0
+      if (!tokens || memExpiresAt > diskExpiresAt) {
+        debugLog('Using in-memory tokens (fresher than disk or disk missing)', {
+          diskExpiresAt,
+          memExpiresAt,
+        })
+        tokens = this.inMemoryTokens
+      }
+    }
 
     if (!tokens) {
       debugLog('Token result: Not found')
@@ -416,7 +482,28 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
       ...(expiresAt ? { expires_at: expiresAt } : {}),
     }
 
-    await writeJsonFile(this.serverUrlHash, 'tokens.json', tokensWithExpiry)
+    // Cache the tokens in memory unconditionally — they're valid right now
+    // regardless of whether the disk write succeeds. Subsequent reads via
+    // tokens() can fall back to this cache if readJsonFile returns stale or
+    // ENOENT'd state.
+    this.inMemoryTokens = tokensWithExpiry
+
+    // Persist to disk, but do NOT throw if persistence fails. A failed write
+    // is annoying (the next mcp-remote process won't see these tokens until
+    // a successful save) but it is NOT an auth failure — the tokens are
+    // perfectly usable in this process. If we throw here, the SDK treats
+    // saveTokens-rejection as an auth flow failure and triggers a fresh
+    // OAuth round (browser tab, PKCE, the works). On Windows with concurrent
+    // mcp-remote subprocesses (which Claude Desktop spawns), this would
+    // cascade into dozens of browser tabs — the "SSO storm" failure mode.
+    try {
+      await writeJsonFile(this.serverUrlHash, 'tokens.json', tokensWithExpiry)
+    } catch (err) {
+      log(
+        `Persisting tokens to disk failed; keeping them in memory for this process. The next mcp-remote subprocess will trigger a fresh refresh. Cause:`,
+        err,
+      )
+    }
   }
 
   /**
@@ -440,6 +527,22 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     log(`\nPlease authorize this client by visiting:\n${authorizationUrl.toString()}\n`)
 
     debugLog('Redirecting to authorization URL', authorizationUrl.toString())
+
+    // Cooldown: skip the actual browser open if we just opened one recently.
+    // This is a safety net for cases where the SDK retries auth in a tight
+    // loop (e.g. concurrent saveTokens failures triggering fresh OAuth
+    // attempts before the C1/C2 fixes catch them). One real auth click is
+    // enough; we don't need to stack 41 tabs even if something upstream
+    // misbehaves.
+    const sinceLast = Date.now() - this.lastBrowserOpenAt
+    if (sinceLast < NodeOAuthClientProvider.BROWSER_OPEN_COOLDOWN_MS) {
+      log(
+        `Browser open suppressed (last open was ${sinceLast}ms ago, cooldown ${NodeOAuthClientProvider.BROWSER_OPEN_COOLDOWN_MS}ms). ` +
+          `If a tab is already open, complete the auth there. Otherwise copy/paste the URL above.`,
+      )
+      return
+    }
+    this.lastBrowserOpenAt = Date.now()
 
     try {
       await open(sanitizeUrl(authorizationUrl.toString()))
