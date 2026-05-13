@@ -364,5 +364,31 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
       // Pre-fix: open() was called 3 times. Post-fix: only once.
       expect(openMock).toHaveBeenCalledTimes(1)
     })
+
+    it('redirectToAuthorization suppresses entirely if tokens were saved recently', async () => {
+      const openMod = await import('open')
+      const openMock = vi.mocked(openMod.default)
+      openMock.mockClear()
+
+      provider = new NodeOAuthClientProvider(defaultOptions)
+      const url = new URL('https://idp.example.com/auth?x=1')
+
+      // Simulate a successful token refresh that just landed. The SDK now
+      // reaches the auth path due to a transient error (e.g. a 401 from
+      // an upstream that lost in-memory session state). We must not open
+      // a browser — our tokens are valid.
+      await provider.saveTokens({
+        access_token: 'at-fresh',
+        token_type: 'Bearer',
+        refresh_token: 'rt-fresh',
+        expires_in: 7200,
+      })
+
+      await provider.redirectToAuthorization(url)
+      await provider.redirectToAuthorization(url)
+
+      // Zero browser tabs — the "tokens just saved" guard catches everything.
+      expect(openMock).toHaveBeenCalledTimes(0)
+    })
   })
 })

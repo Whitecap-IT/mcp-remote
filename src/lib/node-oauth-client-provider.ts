@@ -58,6 +58,17 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   private static readonly BROWSER_OPEN_COOLDOWN_MS = 30_000
   private lastBrowserOpenAt = 0
 
+  // Timestamp of the most recent successful saveTokens() call. If we just
+  // got fresh tokens (either via OAuth flow or refresh_token exchange), any
+  // subsequent "must authenticate" signal in the next AUTH_RECENT_WINDOW_MS
+  // is treated as a transient bug rather than a real auth failure. The SDK
+  // sometimes calls into the auth path on transient errors (e.g. a 401 from
+  // an upstream that just lost in-memory session state) — suppressing a
+  // browser tab in that window prevents the visible storm. The user's
+  // tokens are valid; the SDK can retry with the existing Bearer header.
+  private static readonly AUTH_RECENT_WINDOW_MS = 60_000
+  private lastSuccessfulSaveAt = 0
+
   // Refresh the access_token when it has this many ms left. 60 seconds gives
   // plenty of buffer to round-trip the refresh exchange before the SDK uses it.
   private static readonly REFRESH_BUFFER_MS = 60_000
@@ -488,6 +499,11 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     // ENOENT'd state.
     this.inMemoryTokens = tokensWithExpiry
 
+    // Record that we just acquired fresh tokens. Used by
+    // redirectToAuthorization to suppress browser tabs that the SDK opens
+    // due to transient auth-related errors right after a refresh.
+    this.lastSuccessfulSaveAt = Date.now()
+
     // Persist to disk, but do NOT throw if persistence fails. A failed write
     // is annoying (the next mcp-remote process won't see these tokens until
     // a successful save) but it is NOT an auth failure — the tokens are
@@ -528,16 +544,29 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
 
     debugLog('Redirecting to authorization URL', authorizationUrl.toString())
 
-    // Cooldown: skip the actual browser open if we just opened one recently.
-    // This is a safety net for cases where the SDK retries auth in a tight
-    // loop (e.g. concurrent saveTokens failures triggering fresh OAuth
-    // attempts before the C1/C2 fixes catch them). One real auth click is
-    // enough; we don't need to stack 41 tabs even if something upstream
-    // misbehaves.
-    const sinceLast = Date.now() - this.lastBrowserOpenAt
-    if (sinceLast < NodeOAuthClientProvider.BROWSER_OPEN_COOLDOWN_MS) {
+    // Guard 1: if we just acquired fresh tokens (within AUTH_RECENT_WINDOW_MS)
+    // the SDK reaching this code path is almost certainly a false alarm —
+    // some transient upstream error that the SDK misclassified as an auth
+    // failure. Our tokens are valid; opening a browser tab would confuse
+    // the user. Log and skip.
+    const sinceSave = Date.now() - this.lastSuccessfulSaveAt
+    if (this.lastSuccessfulSaveAt > 0 && sinceSave < NodeOAuthClientProvider.AUTH_RECENT_WINDOW_MS) {
       log(
-        `Browser open suppressed (last open was ${sinceLast}ms ago, cooldown ${NodeOAuthClientProvider.BROWSER_OPEN_COOLDOWN_MS}ms). ` +
+        `Browser open suppressed: tokens were saved ${sinceSave}ms ago (within ` +
+          `${NodeOAuthClientProvider.AUTH_RECENT_WINDOW_MS}ms window). Existing tokens are valid; ` +
+          `the SDK reached the auth path due to a transient error. Not opening a tab.`,
+      )
+      return
+    }
+
+    // Guard 2: cooldown between actual browser opens. Even if the SDK has
+    // genuinely lost auth and we need to re-authenticate, one tab is
+    // enough — don't stack them. If the user closed the previous tab
+    // without completing auth, they'll retry after the cooldown.
+    const sinceLastOpen = Date.now() - this.lastBrowserOpenAt
+    if (sinceLastOpen < NodeOAuthClientProvider.BROWSER_OPEN_COOLDOWN_MS) {
+      log(
+        `Browser open suppressed (last open was ${sinceLastOpen}ms ago, cooldown ${NodeOAuthClientProvider.BROWSER_OPEN_COOLDOWN_MS}ms). ` +
           `If a tab is already open, complete the auth there. Otherwise copy/paste the URL above.`,
       )
       return
