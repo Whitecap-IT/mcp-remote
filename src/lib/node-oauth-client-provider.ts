@@ -12,7 +12,7 @@ import { readJsonFile, writeJsonFile, readTextFile, writeTextFile, deleteConfigF
 import { StaticOAuthClientInformationFull } from './types'
 import { log, debugLog, MCP_REMOTE_VERSION } from './utils'
 import { sanitizeUrl } from 'strict-url-sanitise'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { fetchAuthorizationServerMetadata, type AuthorizationServerMetadata } from './authorization-server-metadata'
 import type { ProtectedResourceMetadata } from './protected-resource-metadata'
 import { isInvalidGrantError } from './auth-errors'
@@ -61,17 +61,43 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   // computed expires_at so tokens() can decide whether to refresh.
   private inMemoryTokens: StoredOAuthTokens | null = null
 
-  // Per-process suppression of repeat browser opens. The SDK can call
-  // redirectToAuthorization() many times in quick succession when something
-  // else in the auth pipeline keeps failing (e.g. a Windows token-write race
-  // that throws → SDK treats as auth failure → restart auth). Without this
-  // guard, every retry opens a fresh tab — the "SSO storm" the user sees.
-  // We allow one open per BROWSER_OPEN_COOLDOWN_MS; subsequent calls just log
-  // the URL so a human can paste it if needed but don't spawn a tab. The guard
-  // is scoped to one OAuth attempt/state so a fresh retry is still visible.
-  private static readonly BROWSER_OPEN_COOLDOWN_MS = 30_000
-  private lastBrowserOpenAt = 0
-  private lastBrowserOpenAttemptKey: string | null = null
+  // Single-flight authorization gate. The MCP SDK's auth path is:
+  //
+  //   state() -> generate verifier+challenge -> saveCodeVerifier() ->
+  //   redirectToAuthorization() -> callback receives code ->
+  //   finishAuth(code) -> saveTokens()
+  //
+  // When the SDK's own SSE-reconnect loop AND our ReconnectionManager both
+  // hit auth at roughly the same moment, two parallel passes through this
+  // chain race each other. The visible symptom is many browser tabs opening.
+  // The subtler bug is verifier corruption: pass A computes verifier-A and
+  // writes it to disk, then pass B overwrites with verifier-B, then pass A's
+  // browser tab returns a code that was minted for challenge-A, but the
+  // verifier on disk is now verifier-B. Token exchange returns
+  // "Code not valid".
+  //
+  // Fix: a single in-flight attempt across the whole chain. The gate is
+  // established at the FIRST mutation point (state()) and released only
+  // AFTER saveTokens() has persisted new tokens. During the window between,
+  // duplicate callers get the active attempt's state echoed back, cannot
+  // overwrite the verifier, and cannot trigger new browser tabs.
+  private static readonly ACTIVE_AUTH_TTL_MS = 5 * 60 * 1000
+  private activeAuthAttempt: {
+    state: string
+    codeVerifier: string | null
+    codeChallenge: string | null
+    startedAt: number
+  } | null = null
+
+  // Backoff window after an invalid_grant terminal rejection. While set,
+  // redirectToAuthorization() and tokens() refuse to start a new attempt -
+  // gives the user breathing room and prevents the proxy from churning
+  // through OAuth round trips against an IdP that is currently saying "no".
+  private invalidGrantBackoffUntil = 0
+  private consecutiveInvalidGrants = 0
+  private static readonly INVALID_GRANT_BACKOFF_BASE_MS = 2_000
+  private static readonly INVALID_GRANT_BACKOFF_CAP_MS = 60_000
+  private static readonly INVALID_GRANT_TERMINAL_THRESHOLD = 3
 
   // Timestamp of the most recent successful saveTokens() call. If we just
   // got fresh tokens (either via OAuth flow or refresh_token exchange), any
@@ -129,20 +155,60 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     }
   }
 
-  // Intentionally side-effecting: the SDK calls state() once per OAuth
-  // authorization request, so each call rotates `_state` to a fresh UUID.
-  // Reusing a state across retries was the root cause of the wcap.14/15
-  // "Code not valid" loop (Keycloak associates auth_code + PKCE verifier
-  // with the original state; a later retry using the same state but a new
-  // verifier fails the token exchange). Use currentState() if you need to
-  // read the active value without rotating.
+  // First call into the OAuth flow during an auth attempt. The single-flight
+  // gate lives here because state() is the EARLIEST mutation point: rotating
+  // state without coordinating saveCodeVerifier() leaves a window where two
+  // racing reconnect paths can swap each other's PKCE material and produce
+  // "Code not valid" even with only one tab open. Behavior:
+  //
+  //   - No active attempt (or active attempt past its TTL): start a new
+  //     attempt with a fresh state.
+  //   - Active attempt: return the same state. The caller participates in
+  //     the in-flight attempt instead of starting its own.
+  //
+  // currentState() exposes the active state without rotating; used by the
+  // callback server to validate `state=` on the OAuth redirect.
   state(): string {
-    this._state = randomUUID()
+    this.purgeExpiredAttempt()
+    if (!this.activeAuthAttempt) {
+      this.activeAuthAttempt = {
+        state: randomUUID(),
+        codeVerifier: null,
+        codeChallenge: null,
+        startedAt: Date.now(),
+      }
+      this._state = this.activeAuthAttempt.state
+      debugLog('OAuth attempt started', { state: this._state })
+    } else {
+      debugLog('OAuth attempt already active; reusing state', {
+        state: this.activeAuthAttempt.state,
+        ageMs: Date.now() - this.activeAuthAttempt.startedAt,
+      })
+    }
     return this._state
   }
 
   currentState(): string {
     return this._state
+  }
+
+  private purgeExpiredAttempt(): void {
+    if (!this.activeAuthAttempt) return
+    const age = Date.now() - this.activeAuthAttempt.startedAt
+    if (age > NodeOAuthClientProvider.ACTIVE_AUTH_TTL_MS) {
+      debugLog('Active OAuth attempt expired; releasing gate', { ageMs: age })
+      this.activeAuthAttempt = null
+    }
+  }
+
+  private releaseAuthAttempt(reason: string): void {
+    if (!this.activeAuthAttempt) return
+    debugLog('Releasing OAuth attempt', { state: this.activeAuthAttempt.state, reason })
+    this.activeAuthAttempt = null
+  }
+
+  private static pkceChallengeForVerifier(verifier: string): string {
+    return createHash('sha256').update(verifier).digest('base64url')
   }
 
   /**
@@ -543,6 +609,15 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
         err,
       )
     }
+
+    // The single-flight gate is released ONLY here, after the token
+    // exchange has completed and new tokens are persisted. Releasing
+    // earlier (e.g. on callback receipt) reopens the race: a parallel
+    // reconnect path could rotate state() and overwrite the verifier
+    // between callback and finishAuth, making the auth_code unredeemable.
+    this.releaseAuthAttempt('saveTokens-success')
+    this.consecutiveInvalidGrants = 0
+    this.invalidGrantBackoffUntil = 0
   }
 
   /**
@@ -567,11 +642,10 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
 
     debugLog('Redirecting to authorization URL', authorizationUrl.toString())
 
-    // Guard 1: if we just acquired fresh tokens (within AUTH_RECENT_WINDOW_MS)
-    // the SDK reaching this code path is almost certainly a false alarm —
-    // some transient upstream error that the SDK misclassified as an auth
-    // failure. Our tokens are valid; opening a browser tab would confuse
-    // the user. Log and skip.
+    // Guard 1: recently saved tokens. If we just persisted fresh tokens
+    // within AUTH_RECENT_WINDOW_MS, the SDK reaching this code path is
+    // almost certainly a false alarm; our tokens are valid and the SDK can
+    // retry the request with its existing Bearer header.
     const sinceSave = Date.now() - this.lastSuccessfulSaveAt
     if (this.lastSuccessfulSaveAt > 0 && sinceSave < NodeOAuthClientProvider.AUTH_RECENT_WINDOW_MS) {
       log(
@@ -582,20 +656,35 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
       return
     }
 
-    // Guard 2: cooldown between actual browser opens for the same OAuth
-    // attempt. Fresh retries have a new state value and should be allowed to
-    // open a browser even if the previous attempt happened seconds ago.
-    const attemptKey = authorizationUrl.searchParams.get('state') || authorizationUrl.toString()
-    const sinceLastOpen = Date.now() - this.lastBrowserOpenAt
-    if (this.lastBrowserOpenAttemptKey === attemptKey && sinceLastOpen < NodeOAuthClientProvider.BROWSER_OPEN_COOLDOWN_MS) {
+    // Guard 2: invalid_grant backoff. After a token-exchange failure we
+    // refuse new OAuth round trips for an exponential window so we are not
+    // spamming an IdP that just said "no".
+    const backoffRemaining = this.invalidGrantBackoffUntil - Date.now()
+    if (backoffRemaining > 0) {
       log(
-        `Browser open suppressed (last open was ${sinceLastOpen}ms ago, cooldown ${NodeOAuthClientProvider.BROWSER_OPEN_COOLDOWN_MS}ms). ` +
-          `If a tab is already open, complete the auth there. Otherwise copy/paste the URL above.`,
+        `Browser open suppressed: invalid_grant backoff in effect (${Math.ceil(backoffRemaining / 1000)}s remaining). ` +
+          `Wait, then retry from Claude Desktop.`,
       )
       return
     }
-    this.lastBrowserOpenAt = Date.now()
-    this.lastBrowserOpenAttemptKey = attemptKey
+
+    // Guard 3: PKCE challenge match. The single-flight gate guarantees
+    // only one verifier is associated with the active attempt. If the URL
+    // the SDK handed us was built with a DIFFERENT challenge, it came from
+    // a duplicate auth pass that lost the race in saveCodeVerifier(). It is
+    // unredeemable - the auth_code its tab would mint cannot be exchanged
+    // against the verifier we have stored. Suppress quietly.
+    this.purgeExpiredAttempt()
+    const attempt = this.activeAuthAttempt
+    const urlChallenge = authorizationUrl.searchParams.get('code_challenge')
+    if (attempt && attempt.codeChallenge && urlChallenge && urlChallenge !== attempt.codeChallenge) {
+      debugLog('Suppressing redirectToAuthorization for stale challenge', {
+        state: attempt.state,
+        urlState: authorizationUrl.searchParams.get('state'),
+      })
+      log('Auth tab already pending for this server; this duplicate attempt is suppressed.')
+      return
+    }
 
     try {
       await open(sanitizeUrl(authorizationUrl.toString()))
@@ -607,10 +696,52 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   }
 
   /**
-   * Saves the PKCE code verifier
+   * Called by the proxy when the token-exchange step (finishAuth) returns
+   * invalid_grant. We extend the backoff window, count toward the terminal
+   * threshold, and on the Nth strike, do a full credential wipe and release
+   * the gate so the next user action can start clean.
+   */
+  recordInvalidGrant(): void {
+    this.consecutiveInvalidGrants += 1
+    const exp = Math.min(
+      NodeOAuthClientProvider.INVALID_GRANT_BACKOFF_BASE_MS * 2 ** (this.consecutiveInvalidGrants - 1),
+      NodeOAuthClientProvider.INVALID_GRANT_BACKOFF_CAP_MS,
+    )
+    this.invalidGrantBackoffUntil = Date.now() + exp
+    debugLog('invalid_grant backoff scheduled', {
+      consecutive: this.consecutiveInvalidGrants,
+      backoffMs: exp,
+    })
+    if (this.consecutiveInvalidGrants >= NodeOAuthClientProvider.INVALID_GRANT_TERMINAL_THRESHOLD) {
+      log('Persistent invalid_grant errors detected. Wiping cached tokens and PKCE state.')
+      this.invalidateCredentials('tokens').catch((err) => debugLog('terminal invalidate failed', err))
+      this.invalidateCredentials('verifier').catch((err) => debugLog('terminal invalidate failed', err))
+      this.releaseAuthAttempt('invalid_grant-terminal')
+    }
+  }
+
+  /**
+   * Saves the PKCE code verifier. First-writer-wins while an attempt is
+   * active: if state() has already started an attempt and a verifier was
+   * stored for it, subsequent saveCodeVerifier() calls within the same
+   * attempt are no-ops. This prevents a parallel reconnect path from
+   * overwriting verifier-A with verifier-B and then making the auth_code
+   * minted for challenge-A unredeemable.
    * @param codeVerifier The code verifier to save
    */
   async saveCodeVerifier(codeVerifier: string): Promise<void> {
+    this.purgeExpiredAttempt()
+    const attempt = this.activeAuthAttempt
+    if (attempt && attempt.codeVerifier && attempt.codeVerifier !== codeVerifier) {
+      debugLog('Ignoring duplicate saveCodeVerifier for active attempt', {
+        state: attempt.state,
+      })
+      return
+    }
+    if (attempt) {
+      attempt.codeVerifier = codeVerifier
+      attempt.codeChallenge = NodeOAuthClientProvider.pkceChallengeForVerifier(codeVerifier)
+    }
     debugLog('Saving code verifier')
     await writeTextFile(this.serverUrlHash, 'code_verifier.txt', codeVerifier)
   }
@@ -644,6 +775,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
         this.inMemoryTokens = null
         this.refreshPromise = null
         this.lastSuccessfulSaveAt = 0
+        this.releaseAuthAttempt('invalidate-all')
         debugLog('All credentials invalidated')
         break
 
@@ -663,6 +795,11 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
 
       case 'verifier':
         await deleteConfigFile(this.serverUrlHash, 'code_verifier.txt')
+        // Releasing the gate here lets a fresh attempt start. We intentionally
+        // do NOT release on 'tokens'-only invalidation because a token wipe
+        // can happen mid-attempt (e.g. proactive refresh failure) and we
+        // want the in-flight authorization to still complete.
+        this.releaseAuthAttempt('invalidate-verifier')
         debugLog('Code verifier invalidated')
         break
 

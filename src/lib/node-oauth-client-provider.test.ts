@@ -22,6 +22,7 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
   let mockReadJsonFile: any
   let mockWriteJsonFile: any
   let mockDeleteConfigFile: any
+  let mockWriteTextFile: any
 
   const defaultOptions: OAuthProviderOptions = {
     serverUrl: 'https://example.com',
@@ -34,10 +35,12 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
     mockReadJsonFile = vi.mocked(mcpAuthConfig.readJsonFile)
     mockWriteJsonFile = vi.mocked(mcpAuthConfig.writeJsonFile)
     mockDeleteConfigFile = vi.mocked(mcpAuthConfig.deleteConfigFile)
+    mockWriteTextFile = vi.mocked(mcpAuthConfig.writeTextFile)
 
     mockReadJsonFile.mockResolvedValue(undefined)
     mockWriteJsonFile.mockResolvedValue(undefined)
     mockDeleteConfigFile.mockResolvedValue(undefined)
+    mockWriteTextFile.mockResolvedValue(undefined)
   })
 
   afterEach(() => {
@@ -305,14 +308,27 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
   })
 
   describe('storm resistance (C1/C2/C5)', () => {
-    it('rotates OAuth state for each browser authorization attempt', () => {
+    it('returns the same state while an OAuth attempt is active, rotates after saveTokens', async () => {
       provider = new NodeOAuthClientProvider(defaultOptions)
 
+      // Parallel reconnect paths both reach state() before the attempt
+      // completes - they MUST get the same value (single-flight gate),
+      // otherwise the verifier-overwrite race causes "Code not valid".
       const firstState = provider.state()
       const secondState = provider.state()
+      expect(secondState).toBe(firstState)
+      expect(provider.currentState()).toBe(firstState)
 
-      expect(secondState).not.toBe(firstState)
-      expect(provider.currentState()).toBe(secondState)
+      // saveTokens completes the attempt; the gate is released.
+      await provider.saveTokens({
+        access_token: 'at',
+        token_type: 'Bearer',
+        refresh_token: 'rt',
+        expires_in: 3600,
+      })
+
+      const thirdState = provider.state()
+      expect(thirdState).not.toBe(firstState)
     })
 
     it('saveTokens does not throw when disk write fails', async () => {
@@ -402,33 +418,126 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
       expect(mockDeleteConfigFile).toHaveBeenCalledWith('test-hash', 'tokens.json')
     })
 
-    it('redirectToAuthorization suppresses repeat browser opens inside the cooldown', async () => {
+    it('redirectToAuthorization suppresses a duplicate attempt whose code_challenge does not match the active verifier', async () => {
       const openMod = await import('open')
       const openMock = vi.mocked(openMod.default)
       openMock.mockClear()
 
       provider = new NodeOAuthClientProvider(defaultOptions)
-      const url = new URL('https://idp.example.com/auth?x=1')
 
-      await provider.redirectToAuthorization(url)
-      await provider.redirectToAuthorization(url)
-      await provider.redirectToAuthorization(url)
+      // Simulate the SDK's normal flow for attempt A: state -> verifier.
+      provider.state()
+      await provider.saveCodeVerifier('verifier-A-1234567890abcdef')
 
-      // Pre-fix: open() was called 3 times. Post-fix: only once.
+      // Two URLs arrive at redirectToAuthorization. The first carries the
+      // legitimate challenge derived from verifier-A; the second comes from
+      // a parallel SDK path that computed a different challenge before the
+      // gate's first-writer-wins serialized it.
+      const { createHash } = await import('node:crypto')
+      const challengeA = createHash('sha256').update('verifier-A-1234567890abcdef').digest('base64url')
+      const challengeB = createHash('sha256').update('verifier-B-fedcba0987654321').digest('base64url')
+
+      const urlA = new URL('https://idp.example.com/auth')
+      urlA.searchParams.set('code_challenge', challengeA)
+      const urlB = new URL('https://idp.example.com/auth')
+      urlB.searchParams.set('code_challenge', challengeB)
+
+      await provider.redirectToAuthorization(urlA)
+      await provider.redirectToAuthorization(urlB)
+      await provider.redirectToAuthorization(urlB)
+
+      // Only the URL matching the active verifier's challenge opens a tab.
       expect(openMock).toHaveBeenCalledTimes(1)
     })
 
-    it('redirectToAuthorization opens again for a new OAuth state even inside the cooldown', async () => {
+    it('saveCodeVerifier is first-writer-wins within an active attempt', async () => {
+      provider = new NodeOAuthClientProvider(defaultOptions)
+      provider.state()
+
+      const verifierA = 'verifier-A-1234567890abcdef'
+      const verifierB = 'verifier-B-fedcba0987654321'
+
+      await provider.saveCodeVerifier(verifierA)
+      await provider.saveCodeVerifier(verifierB)
+
+      // Only the first writer's verifier reaches disk.
+      const calls = mockWriteTextFile.mock.calls.filter((c: unknown[]) => c[1] === 'code_verifier.txt')
+      expect(calls).toHaveLength(1)
+      expect(calls[0][2]).toBe(verifierA)
+    })
+
+    it('gate stays held between callback and saveTokens to prevent verifier overwrite', async () => {
+      provider = new NodeOAuthClientProvider(defaultOptions)
+
+      // Simulate the SDK's normal flow up to receiving the auth code:
+      // state -> save verifier -> open tab -> (user completes) -> callback
+      // fires -> finishAuth runs. The gate must NOT release on callback
+      // receipt because the token exchange still needs to read the verifier.
+      const firstState = provider.state()
+      await provider.saveCodeVerifier('verifier-A-1234567890abcdef')
+
+      // Pretend the callback has fired and the application is now in the
+      // window between callback receipt and saveTokens. A racing reconnect
+      // path arrives and calls state() + saveCodeVerifier(). It MUST NOT
+      // be allowed to rotate state or overwrite the verifier.
+      const racingState = provider.state()
+      expect(racingState).toBe(firstState)
+
+      await provider.saveCodeVerifier('verifier-B-fedcba0987654321')
+      const calls = mockWriteTextFile.mock.calls.filter((c: unknown[]) => c[1] === 'code_verifier.txt')
+      expect(calls).toHaveLength(1)
+      expect(calls[0][2]).toBe('verifier-A-1234567890abcdef')
+
+      // Token exchange succeeds; saveTokens releases the gate.
+      await provider.saveTokens({
+        access_token: 'at',
+        token_type: 'Bearer',
+        refresh_token: 'rt',
+        expires_in: 3600,
+      })
+
+      // After release, the next attempt rotates.
+      const nextState = provider.state()
+      expect(nextState).not.toBe(firstState)
+    })
+
+    it('TTL expiry releases the gate so a new attempt can start', async () => {
+      vi.useFakeTimers()
+      try {
+        provider = new NodeOAuthClientProvider(defaultOptions)
+        const firstState = provider.state()
+
+        // Advance past the 5-minute TTL without ever calling saveTokens.
+        vi.advanceTimersByTime(5 * 60 * 1000 + 1)
+
+        const secondState = provider.state()
+        expect(secondState).not.toBe(firstState)
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('invalid_grant backoff suppresses new browser opens during the window', async () => {
       const openMod = await import('open')
       const openMock = vi.mocked(openMod.default)
       openMock.mockClear()
 
       provider = new NodeOAuthClientProvider(defaultOptions)
+      provider.state()
+      await provider.saveCodeVerifier('verifier-X-1234567890abcdef')
 
-      await provider.redirectToAuthorization(new URL('https://idp.example.com/auth?state=attempt-1'))
-      await provider.redirectToAuthorization(new URL('https://idp.example.com/auth?state=attempt-2'))
+      const { createHash } = await import('node:crypto')
+      const challenge = createHash('sha256').update('verifier-X-1234567890abcdef').digest('base64url')
 
-      expect(openMock).toHaveBeenCalledTimes(2)
+      // Simulate the proxy recording an invalid_grant after a failed token
+      // exchange. The next redirectToAuthorization must be suppressed.
+      provider.recordInvalidGrant()
+
+      const url = new URL('https://idp.example.com/auth')
+      url.searchParams.set('code_challenge', challenge)
+      await provider.redirectToAuthorization(url)
+
+      expect(openMock).toHaveBeenCalledTimes(0)
     })
 
     it('redirectToAuthorization suppresses entirely if tokens were saved recently', async () => {
