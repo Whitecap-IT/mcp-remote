@@ -67,9 +67,11 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   // that throws → SDK treats as auth failure → restart auth). Without this
   // guard, every retry opens a fresh tab — the "SSO storm" the user sees.
   // We allow one open per BROWSER_OPEN_COOLDOWN_MS; subsequent calls just log
-  // the URL so a human can paste it if needed but don't spawn a tab.
+  // the URL so a human can paste it if needed but don't spawn a tab. The guard
+  // is scoped to one OAuth attempt/state so a fresh retry is still visible.
   private static readonly BROWSER_OPEN_COOLDOWN_MS = 30_000
   private lastBrowserOpenAt = 0
+  private lastBrowserOpenAttemptKey: string | null = null
 
   // Timestamp of the most recent successful saveTokens() call. If we just
   // got fresh tokens (either via OAuth flow or refresh_token exchange), any
@@ -127,7 +129,19 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     }
   }
 
+  // Intentionally side-effecting: the SDK calls state() once per OAuth
+  // authorization request, so each call rotates `_state` to a fresh UUID.
+  // Reusing a state across retries was the root cause of the wcap.14/15
+  // "Code not valid" loop (Keycloak associates auth_code + PKCE verifier
+  // with the original state; a later retry using the same state but a new
+  // verifier fails the token exchange). Use currentState() if you need to
+  // read the active value without rotating.
   state(): string {
+    this._state = randomUUID()
+    return this._state
+  }
+
+  currentState(): string {
     return this._state
   }
 
@@ -568,12 +582,12 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
       return
     }
 
-    // Guard 2: cooldown between actual browser opens. Even if the SDK has
-    // genuinely lost auth and we need to re-authenticate, one tab is
-    // enough — don't stack them. If the user closed the previous tab
-    // without completing auth, they'll retry after the cooldown.
+    // Guard 2: cooldown between actual browser opens for the same OAuth
+    // attempt. Fresh retries have a new state value and should be allowed to
+    // open a browser even if the previous attempt happened seconds ago.
+    const attemptKey = authorizationUrl.searchParams.get('state') || authorizationUrl.toString()
     const sinceLastOpen = Date.now() - this.lastBrowserOpenAt
-    if (sinceLastOpen < NodeOAuthClientProvider.BROWSER_OPEN_COOLDOWN_MS) {
+    if (this.lastBrowserOpenAttemptKey === attemptKey && sinceLastOpen < NodeOAuthClientProvider.BROWSER_OPEN_COOLDOWN_MS) {
       log(
         `Browser open suppressed (last open was ${sinceLastOpen}ms ago, cooldown ${NodeOAuthClientProvider.BROWSER_OPEN_COOLDOWN_MS}ms). ` +
           `If a tab is already open, complete the auth there. Otherwise copy/paste the URL above.`,
@@ -581,6 +595,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
       return
     }
     this.lastBrowserOpenAt = Date.now()
+    this.lastBrowserOpenAttemptKey = attemptKey
 
     try {
       await open(sanitizeUrl(authorizationUrl.toString()))

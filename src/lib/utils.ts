@@ -15,7 +15,7 @@ import {
 } from './protected-resource-metadata'
 import { fetchAuthorizationServerMetadata, type AuthorizationServerMetadata } from './authorization-server-metadata'
 import { ReconnectionManager } from './reconnection-manager'
-import { isAuthFailureError } from './auth-errors'
+import { isAuthFailureError, isInvalidGrantError } from './auth-errors'
 import express from 'express'
 import net from 'net'
 import crypto from 'crypto'
@@ -33,6 +33,10 @@ declare global {
 // Connection constants
 export const REASON_AUTH_NEEDED = 'authentication-needed'
 export const REASON_TRANSPORT_FALLBACK = 'falling-back-to-alternate-transport'
+// 10 minutes covers slow MFA / hardware-token / multi-factor SSO flows
+// without leaving Claude Desktop frozen if the user closes the tab. Override
+// via OAuthCallbackServerOptions.browserAuthTimeoutMs.
+export const DEFAULT_BROWSER_AUTH_TIMEOUT_MS = 10 * 60 * 1000
 
 // Transport strategy types
 export type TransportStrategy = 'sse-only' | 'http-only' | 'sse-first' | 'http-first'
@@ -505,6 +509,7 @@ export async function discoverOAuthServerInfo(
 export type AuthInitializer = () => Promise<{
   waitForAuthCode: () => Promise<string>
   skipBrowserAuth: boolean
+  resetAuth?: () => Promise<void>
 }>
 
 /**
@@ -647,17 +652,47 @@ export async function connectToRemoteServer(
 
       // Initialize authentication on-demand
       debugLog('Calling authInitializer to start auth flow')
-      const { waitForAuthCode, skipBrowserAuth: sharedAuth } = await authInitializer()
+      const { waitForAuthCode, skipBrowserAuth: sharedAuth, resetAuth } = await authInitializer()
 
       if (sharedAuth) {
         log('Authentication required but skipping browser auth - using shared auth')
+        if (recursionReasons.has(REASON_AUTH_NEEDED)) {
+          const errorMessage = `Already attempted reconnection for reason: ${REASON_AUTH_NEEDED}. Giving up.`
+          log(errorMessage)
+          throw new Error(errorMessage)
+        }
+
+        recursionReasons.add(REASON_AUTH_NEEDED)
+        return connectToRemoteServer(
+          client,
+          serverUrl,
+          authProvider,
+          headers,
+          authInitializer,
+          transportStrategy,
+          recursionReasons,
+          skipBrowserAuth,
+        )
       } else {
         log('Authentication required. Waiting for authorization...')
       }
 
-      // Wait for the authorization code from the callback
+      // Wait for the authorization code from the callback. This is a human
+      // browser flow, so it needs a bound; otherwise Claude can look frozen
+      // forever if the tab never opens or the callback never returns.
       debugLog('Waiting for auth code from callback server')
-      const code = await waitForAuthCode()
+      let code: string
+      try {
+        code = await waitForAuthCode()
+      } catch (authWaitError) {
+        log('Authorization did not complete:', authWaitError)
+        debugLog('Authorization wait failed before token exchange', {
+          errorMessage: authWaitError instanceof Error ? authWaitError.message : String(authWaitError),
+          stack: authWaitError instanceof Error ? authWaitError.stack : undefined,
+        })
+        await resetAuth?.()
+        throw authWaitError
+      }
       debugLog('Received auth code from callback server')
 
       try {
@@ -700,18 +735,20 @@ export async function connectToRemoteServer(
 
         // Handle invalid_grant error specifically - this means the refresh token is invalid/expired
         // Clear tokens and trigger fresh authentication
-        const isInvalidGrant =
-          (authError instanceof OAuthError && authError.errorCode === 'invalid_grant') ||
-          (authError.message && authError.message.includes('invalid_grant'))
+        const isInvalidGrant = isInvalidGrantError(authError)
 
         if (isInvalidGrant) {
-          log('Refresh token is invalid or expired. Clearing tokens and re-authenticating...')
-          debugLog('Detected invalid_grant error, invalidating tokens')
+          log('OAuth grant was rejected. Clearing stale auth state and re-authenticating...')
+          debugLog('Detected invalid_grant error, invalidating tokens, verifier, and callback server state')
 
-          // Invalidate the stale tokens
+          // Invalidate stale material from this auth attempt. A failed
+          // authorization-code exchange can leave an old code/verifier/callback
+          // promise behind; reusing any of those causes a Code not valid loop.
           if (authProvider && typeof authProvider.invalidateCredentials === 'function') {
             await authProvider.invalidateCredentials('tokens')
+            await authProvider.invalidateCredentials('verifier')
           }
+          await resetAuth?.()
 
           // If we haven't already retried due to invalid_grant, try fresh auth
           const REASON_INVALID_GRANT = 'invalid-grant-retry'
@@ -752,6 +789,7 @@ export async function connectToRemoteServer(
  */
 export function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbackServerOptions) {
   let authCode: string | null = null
+  let authError: Error | null = null
   const app = express()
 
   // Create a promise to track when auth is completed
@@ -803,8 +841,26 @@ export function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbackServe
   // OAuth callback endpoint
   app.get(options.path, (req, res) => {
     const code = req.query.code as string | undefined
+    const returnedState = req.query.state as string | undefined
+    const expectedState = options.expectedState?.()
     if (!code) {
       res.status(400).send('Error: No authorization code received')
+      return
+    }
+
+    if (expectedState && returnedState !== expectedState) {
+      log('Ignoring OAuth callback for stale auth attempt')
+      debugLog('Rejected OAuth callback due to state mismatch', {
+        expectedState,
+        returnedState,
+      })
+      res.status(409).send('Authorization attempt is no longer current. Please use the newest authorization tab.')
+      return
+    }
+
+    if (authCode) {
+      log('Ignoring duplicate OAuth callback after auth code was already received')
+      res.status(409).send('Authorization code already received. Please return to the application.')
       return
     }
 
@@ -831,16 +887,61 @@ export function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbackServe
     log(`OAuth callback server running at http://127.0.0.1:${options.port}`)
   })
 
+  server.on('error', (error: NodeJS.ErrnoException) => {
+    authError = error
+    log(`OAuth callback server error: ${error.message}`)
+    debugLog('OAuth callback server error', { code: error.code, message: error.message, stack: error.stack })
+    options.events.emit('auth-error', error)
+  })
+
   const waitForAuthCode = (): Promise<string> => {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       if (authCode) {
         resolve(authCode)
         return
       }
 
-      options.events.once('auth-code-received', (code) => {
-        resolve(code)
-      })
+      if (authError) {
+        reject(authError)
+        return
+      }
+
+      const browserAuthTimeoutMs = options.browserAuthTimeoutMs ?? DEFAULT_BROWSER_AUTH_TIMEOUT_MS
+      let settled = false
+      let timeout: NodeJS.Timeout | undefined
+
+      const cleanup = () => {
+        if (timeout) clearTimeout(timeout)
+        options.events.removeListener('auth-code-received', onCode)
+        options.events.removeListener('auth-error', onError)
+      }
+
+      const finish = (fn: () => void) => {
+        if (settled) return
+        settled = true
+        cleanup()
+        fn()
+      }
+
+      const onCode = (code: string) => {
+        finish(() => resolve(code))
+      }
+
+      const onError = (error: Error) => {
+        finish(() => reject(error))
+      }
+
+      timeout = setTimeout(() => {
+        const error = Object.assign(
+          new Error(`Browser authorization timed out after ${Math.round(browserAuthTimeoutMs / 1000)} seconds`),
+          { status: 401 },
+        )
+        authError = error
+        finish(() => reject(error))
+      }, browserAuthTimeoutMs)
+
+      options.events.once('auth-code-received', onCode)
+      options.events.once('auth-error', onError)
     })
   }
 

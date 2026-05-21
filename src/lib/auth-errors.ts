@@ -22,6 +22,8 @@ export function isAuthFailureError(err: unknown): boolean {
     isInvalidGrantError(err) ||
     msg.includes('unauthorized') ||
     msg.includes('authentication required') ||
+    msg.includes('browser authorization timed out') ||
+    msg.includes('authorization timed out') ||
     msg.includes('invalid_token')
   )
 }

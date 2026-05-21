@@ -305,6 +305,16 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
   })
 
   describe('storm resistance (C1/C2/C5)', () => {
+    it('rotates OAuth state for each browser authorization attempt', () => {
+      provider = new NodeOAuthClientProvider(defaultOptions)
+
+      const firstState = provider.state()
+      const secondState = provider.state()
+
+      expect(secondState).not.toBe(firstState)
+      expect(provider.currentState()).toBe(secondState)
+    })
+
     it('saveTokens does not throw when disk write fails', async () => {
       provider = new NodeOAuthClientProvider(defaultOptions)
       mockWriteJsonFile.mockRejectedValueOnce(new Error('EPERM: rename failed'))
@@ -406,6 +416,19 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
 
       // Pre-fix: open() was called 3 times. Post-fix: only once.
       expect(openMock).toHaveBeenCalledTimes(1)
+    })
+
+    it('redirectToAuthorization opens again for a new OAuth state even inside the cooldown', async () => {
+      const openMod = await import('open')
+      const openMock = vi.mocked(openMod.default)
+      openMock.mockClear()
+
+      provider = new NodeOAuthClientProvider(defaultOptions)
+
+      await provider.redirectToAuthorization(new URL('https://idp.example.com/auth?state=attempt-1'))
+      await provider.redirectToAuthorization(new URL('https://idp.example.com/auth?state=attempt-2'))
+
+      expect(openMock).toHaveBeenCalledTimes(2)
     })
 
     it('redirectToAuthorization suppresses entirely if tokens were saved recently', async () => {

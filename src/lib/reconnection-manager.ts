@@ -44,7 +44,7 @@ export class ReconnectionManager {
   private config: ReconnectionConfig
   private reconnectFn: () => Promise<Transport>
   private onTransportReplaced: (transport: Transport) => void
-  private onMessagePurged?: (message: JSONRPCMessage) => void
+  private onMessagePurged?: (message: JSONRPCMessage, reason?: string) => void
   private messageQueue: QueuedMessage[] = []
   private capturedInitMessage: JSONRPCMessage | null = null
   private pendingInitId: string | null = null
@@ -57,7 +57,7 @@ export class ReconnectionManager {
     config?: Partial<ReconnectionConfig>
     reconnectFn: () => Promise<Transport>
     onTransportReplaced: (transport: Transport) => void
-    onMessagePurged?: (message: JSONRPCMessage) => void
+    onMessagePurged?: (message: JSONRPCMessage, reason?: string) => void
   }) {
     this.config = { ...DEFAULT_RECONNECTION_CONFIG, ...opts.config }
     this.reconnectFn = opts.reconnectFn
@@ -92,6 +92,18 @@ export class ReconnectionManager {
   }
 
   queueMessage(message: JSONRPCMessage): Promise<void> {
+    if (this.state === 'auth-failed') {
+      const reason = 'Authentication failed. Please complete browser sign-in and retry.'
+      debugLog('Rejecting queued message because authentication is in terminal failed state', {
+        method: message.method,
+        id: message.id,
+      })
+      if (this.onMessagePurged) {
+        this.onMessagePurged(message, reason)
+      }
+      return Promise.resolve()
+    }
+
     return new Promise((resolve, reject) => {
       this.messageQueue.push({ message, resolve, reject, queuedAt: Date.now() })
       debugLog('Queued message during reconnection', { method: message.method, id: message.id })
@@ -189,9 +201,9 @@ export class ReconnectionManager {
             log(
               `Authentication has permanently failed after ${this.consecutiveAuthFailures} attempts. ` +
                 `Your access has likely been revoked, or your refresh token expired. ` +
-                `To recover: quit Claude Desktop, delete %USERPROFILE%\\.mcp-auth\\ (on Windows) or ~/.mcp-auth/ (on macOS/Linux), and restart Claude Desktop to re-authenticate.`,
+                `Please retry the request after completing the browser sign-in prompt. If it still fails, restart Claude Desktop.`,
             )
-            this.purgeStaleMessages()
+            this.failAllQueuedMessages('Authentication failed. Please complete browser sign-in and retry.')
             return
           }
         } else {
@@ -228,6 +240,20 @@ export class ReconnectionManager {
 
     if (stale.length > 0) {
       log(`Purged ${stale.length} stale message(s) from queue`)
+    }
+  }
+
+  private failAllQueuedMessages(reason: string): void {
+    const pending = this.messageQueue.splice(0)
+    for (const item of pending) {
+      item.resolve()
+      if (this.onMessagePurged) {
+        this.onMessagePurged(item.message, reason)
+      }
+    }
+
+    if (pending.length > 0) {
+      log(`Released ${pending.length} queued message(s) after terminal auth failure`)
     }
   }
 

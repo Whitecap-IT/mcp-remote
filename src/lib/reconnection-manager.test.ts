@@ -177,6 +177,33 @@ describe('ReconnectionManager', () => {
       expect(attempts).toBe(3)
     })
 
+    it('releases queued messages when auth enters terminal failed state', async () => {
+      const m = makeManager(
+        async () => {
+          const err = new Error('Authentication required') as Error & { status: number }
+          err.status = 401
+          throw err
+        },
+        {
+          maxAuthFailuresBeforeGiveUp: 2,
+          maxRetriesBeforeWaiting: 100,
+        },
+      )
+
+      const queued = m.queueMessage({ jsonrpc: '2.0', id: 1, method: 'tools/call' })
+      const p = m.triggerReconnection('test-auth-terminal')
+      await vi.runAllTimersAsync()
+      await p
+      await queued
+
+      expect(m.getState()).toBe('auth-failed')
+      expect(messagesPurged).toEqual([{ jsonrpc: '2.0', id: 1, method: 'tools/call' }])
+
+      await m.queueMessage({ jsonrpc: '2.0', id: 2, method: 'tools/call' })
+      expect(messagesPurged).toHaveLength(2)
+      expect(messagesPurged[1].id).toBe(2)
+    })
+
     it('does not transition to auth-failed for non-auth errors', async () => {
       let attempts = 0
       const m = makeManager(

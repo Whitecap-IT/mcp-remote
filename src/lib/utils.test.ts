@@ -1078,6 +1078,45 @@ describe('setupOAuthCallbackServerWithLongPoll', () => {
     expect(server).toBeDefined()
     expect(typeof result.waitForAuthCode).toBe('function')
   })
+
+  it('should reject stale OAuth callbacks whose state no longer matches', async () => {
+    let currentState = 'fresh-state'
+    const result = setupOAuthCallbackServerWithLongPoll({
+      port: 0,
+      path: '/oauth/callback',
+      events,
+      expectedState: () => currentState,
+    })
+
+    server = result.server
+    if (!server.address()) {
+      await new Promise<void>((resolve) => server.once('listening', resolve))
+    }
+    const address = server.address()
+    const port = typeof address === 'object' && address ? address.port : 0
+
+    const staleResponse = await fetch(`http://127.0.0.1:${port}/oauth/callback?code=stale-code&state=old-state`)
+    expect(staleResponse.status).toBe(409)
+
+    const waitForCode = result.waitForAuthCode()
+    const freshResponse = await fetch(`http://127.0.0.1:${port}/oauth/callback?code=fresh-code&state=${currentState}`)
+
+    expect(freshResponse.status).toBe(200)
+    await expect(waitForCode).resolves.toBe('fresh-code')
+  })
+
+  it('should time out when browser authorization never completes', async () => {
+    const result = setupOAuthCallbackServerWithLongPoll({
+      port: 0,
+      path: '/oauth/callback',
+      events,
+      browserAuthTimeoutMs: 20,
+    })
+
+    server = result.server
+
+    await expect(result.waitForAuthCode()).rejects.toThrow('Browser authorization timed out')
+  })
 })
 
 describe('Feature: Server URL Hash Generation', () => {

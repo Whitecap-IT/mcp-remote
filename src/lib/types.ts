@@ -53,6 +53,10 @@ export interface OAuthCallbackServerOptions {
   events: EventEmitter
   /** Timeout in milliseconds for the auth callback server's long poll */
   authTimeoutMs?: number
+  /** Timeout in milliseconds for a human/browser OAuth authorization attempt */
+  browserAuthTimeoutMs?: number
+  /** Returns the OAuth state for the currently active browser auth attempt */
+  expectedState?: () => string | undefined
 }
 
 // optional tatic OAuth client information

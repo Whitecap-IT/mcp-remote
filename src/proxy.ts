@@ -46,9 +46,6 @@ async function runProxy(
   // Set up event emitter for auth flow
   const events = new EventEmitter()
 
-  // Create a lazy auth coordinator
-  const authCoordinator = createLazyAuthCoordinator(serverUrlHash, callbackPort, events, authTimeoutMs)
-
   // Discover OAuth server info via Protected Resource Metadata (RFC 9728)
   // This probes the MCP server for WWW-Authenticate header and fetches PRM
   log('Discovering OAuth server configuration...')
@@ -80,6 +77,11 @@ async function runProxy(
     wwwAuthenticateScope: discoveryResult.wwwAuthenticateScope,
   })
 
+  // Create a lazy auth coordinator after the provider exists so the callback
+  // server can reject stale browser tabs whose OAuth state no longer matches
+  // the current PKCE attempt.
+  const authCoordinator = createLazyAuthCoordinator(serverUrlHash, callbackPort, events, authTimeoutMs, () => authProvider.currentState())
+
   // Create the STDIO transport for local connections
   const localTransport = new StdioServerTransport()
 
@@ -104,6 +106,7 @@ async function runProxy(
     return {
       waitForAuthCode: authState.waitForAuthCode,
       skipBrowserAuth: authState.skipBrowserAuth,
+      resetAuth: authCoordinator.resetAuth,
     }
   }
 
@@ -146,7 +149,7 @@ async function runProxy(
         remoteTransport = newTransport
         log('Server transport replaced successfully')
       },
-      onMessagePurged: (message) => {
+      onMessagePurged: (message, reason) => {
         if (message.id) {
           log(`Sending error response for purged request ${message.id} (${message.method})`)
           localTransport
@@ -155,7 +158,7 @@ async function runProxy(
               id: message.id,
               error: {
                 code: -32603,
-                message: 'Server temporarily unavailable, please retry',
+                message: reason || 'Server temporarily unavailable, please retry',
               },
             })
             .catch((err: Error) => log('Failed to send purge error response:', err.message))

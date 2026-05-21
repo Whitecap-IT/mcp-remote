@@ -4,7 +4,7 @@ import { Server } from 'http'
 import express from 'express'
 import { AddressInfo } from 'net'
 import { unlinkSync } from 'fs'
-import { log, debugLog, setupOAuthCallbackServerWithLongPoll } from './utils'
+import { DEFAULT_BROWSER_AUTH_TIMEOUT_MS, log, debugLog, setupOAuthCallbackServerWithLongPoll } from './utils'
 
 export type AuthCoordinator = {
   initializeAuth: () => Promise<{ server: Server; waitForAuthCode: () => Promise<string>; skipBrowserAuth: boolean }>
@@ -81,12 +81,13 @@ export async function isLockValid(lockData: LockfileData): Promise<boolean> {
  * @param port The port to connect to
  * @returns True if authentication completed successfully, false otherwise
  */
-export async function waitForAuthentication(port: number): Promise<boolean> {
+export async function waitForAuthentication(port: number, timeoutMs = DEFAULT_BROWSER_AUTH_TIMEOUT_MS): Promise<boolean> {
   log(`Waiting for authentication from the server on port ${port}...`)
 
   try {
     let attempts = 0
-    while (true) {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
       attempts++
       const url = `http://127.0.0.1:${port}/wait-for-auth`
       log(`Querying: ${url}`)
@@ -115,6 +116,9 @@ export async function waitForAuthentication(port: number): Promise<boolean> {
         await new Promise((resolve) => setTimeout(resolve, 2000))
       }
     }
+
+    log(`Timed out waiting for authentication from the server on port ${port}`)
+    return false
   } catch (error) {
     log(`Error waiting for authentication: ${(error as Error).message}`)
     debugLog(`Error waiting for authentication`, error)
@@ -134,6 +138,7 @@ export function createLazyAuthCoordinator(
   callbackPort: number,
   events: EventEmitter,
   authTimeoutMs: number,
+  expectedState?: () => string | undefined,
 ): AuthCoordinator {
   let authState: { server: Server; waitForAuthCode: () => Promise<string>; skipBrowserAuth: boolean } | null = null
 
@@ -149,7 +154,7 @@ export function createLazyAuthCoordinator(
       debugLog('Initializing auth coordination on-demand', { serverUrlHash, callbackPort })
 
       // Initialize auth using the existing coordinateAuth logic
-      authState = await coordinateAuth(serverUrlHash, callbackPort, events, authTimeoutMs)
+      authState = await coordinateAuth(serverUrlHash, callbackPort, events, authTimeoutMs, expectedState)
       debugLog('Auth coordination completed', { skipBrowserAuth: authState.skipBrowserAuth })
       return authState
     },
@@ -188,17 +193,15 @@ export async function coordinateAuth(
   callbackPort: number,
   events: EventEmitter,
   authTimeoutMs: number,
+  expectedState?: () => string | undefined,
 ): Promise<{ server: Server; waitForAuthCode: () => Promise<string>; skipBrowserAuth: boolean }> {
   debugLog('Coordinating authentication', { serverUrlHash, callbackPort })
 
-  // Check for a lockfile (disabled on Windows for the time being)
-  const lockData = process.platform === 'win32' ? null : await checkLockfile(serverUrlHash)
-
-  if (process.platform === 'win32') {
-    debugLog('Skipping lockfile check on Windows')
-  } else {
-    debugLog('Lockfile check result', { found: !!lockData, lockData })
-  }
+  // Check for a lockfile. This is intentionally enabled on Windows too:
+  // Claude Desktop can spawn overlapping mcp-remote processes, and without
+  // coordination they can race each other's browser tabs and PKCE files.
+  const lockData = await checkLockfile(serverUrlHash)
+  debugLog('Lockfile check result', { found: !!lockData, lockData })
 
   // If there's a valid lockfile, try to use the existing auth process
   if (lockData && (await isLockValid(lockData))) {
@@ -253,12 +256,24 @@ export async function coordinateAuth(
     path: '/oauth/callback',
     events,
     authTimeoutMs,
+    expectedState,
   })
 
   // Get the actual port the server is running on
   let address = server.address() as AddressInfo | null
   if (!address) {
-    await new Promise<void>((resolve) => server.once('listening', resolve))
+    await new Promise<void>((resolve, reject) => {
+      const onListening = () => {
+        server.removeListener('error', onError)
+        resolve()
+      }
+      const onError = (error: Error) => {
+        server.removeListener('listening', onListening)
+        reject(error)
+      }
+      server.once('listening', onListening)
+      server.once('error', onError)
+    })
     address = server.address() as AddressInfo | null
   }
 

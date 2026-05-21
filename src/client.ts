@@ -43,9 +43,6 @@ async function runClient(
   // Set up event emitter for auth flow
   const events = new EventEmitter()
 
-  // Create a lazy auth coordinator
-  const authCoordinator = createLazyAuthCoordinator(serverUrlHash, callbackPort, events, authTimeoutMs)
-
   // Discover OAuth server info via Protected Resource Metadata (RFC 9728)
   // This probes the MCP server for WWW-Authenticate header and fetches PRM
   log('Discovering OAuth server configuration...')
@@ -75,6 +72,11 @@ async function runClient(
     protectedResourceMetadata: discoveryResult.protectedResourceMetadata,
     wwwAuthenticateScope: discoveryResult.wwwAuthenticateScope,
   })
+
+  // Create a lazy auth coordinator after the provider exists so the callback
+  // server can reject stale browser tabs whose OAuth state no longer matches
+  // the current PKCE attempt.
+  const authCoordinator = createLazyAuthCoordinator(serverUrlHash, callbackPort, events, authTimeoutMs, () => authProvider.currentState())
 
   // Create the client
   const client = new Client(
@@ -108,6 +110,7 @@ async function runClient(
     return {
       waitForAuthCode: authState.waitForAuthCode,
       skipBrowserAuth: authState.skipBrowserAuth,
+      resetAuth: authCoordinator.resetAuth,
     }
   }
 
