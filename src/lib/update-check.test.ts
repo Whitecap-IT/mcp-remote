@@ -3,7 +3,7 @@ import { promises as fs } from 'fs'
 import * as os from 'os'
 import * as path from 'path'
 
-const CURRENT_VERSION = '0.1.38-wcap.17'
+const CURRENT_VERSION = '0.1.38-wcap.18'
 
 vi.mock('./utils', () => ({
   log: vi.fn(),
@@ -41,6 +41,30 @@ function makeFetchOk(latest: string) {
     status: 200,
     json: async () => ({ 'dist-tags': { latest } }),
   })) as unknown as typeof fetch
+}
+
+function makeFetchOkWithTarball(latest: string) {
+  return vi
+    .fn()
+    .mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        'dist-tags': { latest },
+        versions: {
+          [latest]: {
+            dist: {
+              tarball: 'https://npm.example.com/@wcap/mcp-remote/-/mcp-remote.tgz',
+            },
+          },
+        },
+      }),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      arrayBuffer: async () => Buffer.from('fake-tarball').buffer,
+    }) as unknown as typeof fetch
 }
 
 function makeFetchFail() {
@@ -103,16 +127,16 @@ describe('update-check', () => {
   describe('isNewerVersion', () => {
     it('treats wcap suffixes numerically', async () => {
       const { isNewerVersion } = await import('./update-check')
-      expect(isNewerVersion('0.1.38-wcap.18', '0.1.38-wcap.17')).toBe(true)
-      expect(isNewerVersion('0.1.38-wcap.17', '0.1.38-wcap.17')).toBe(false)
-      expect(isNewerVersion('0.1.38-wcap.16', '0.1.38-wcap.17')).toBe(false)
+      expect(isNewerVersion('0.1.38-wcap.19', '0.1.38-wcap.18')).toBe(true)
+      expect(isNewerVersion('0.1.38-wcap.18', '0.1.38-wcap.18')).toBe(false)
+      expect(isNewerVersion('0.1.38-wcap.17', '0.1.38-wcap.18')).toBe(false)
     })
 
     it('handles patch and minor bumps', async () => {
       const { isNewerVersion } = await import('./update-check')
-      expect(isNewerVersion('0.1.39-wcap.1', '0.1.38-wcap.17')).toBe(true)
-      expect(isNewerVersion('0.2.0-wcap.1', '0.1.38-wcap.17')).toBe(true)
-      expect(isNewerVersion('1.0.0', '0.1.38-wcap.17')).toBe(true)
+      expect(isNewerVersion('0.1.39-wcap.1', '0.1.38-wcap.18')).toBe(true)
+      expect(isNewerVersion('0.2.0-wcap.1', '0.1.38-wcap.18')).toBe(true)
+      expect(isNewerVersion('1.0.0', '0.1.38-wcap.18')).toBe(true)
     })
 
     it('handles the wcap.10+ vs wcap.9 edge', async () => {
@@ -164,7 +188,25 @@ describe('update-check', () => {
         '@wcap/mcp-remote@0.1.38-wcap.99',
         '--registry',
         'https://npm.example.com/',
+        '--prefer-online',
       ])
+    })
+
+    it('downloads and installs the exact tarball when registry metadata exposes one', async () => {
+      globalThis.fetch = makeFetchOkWithTarball('0.1.38-wcap.99')
+      makeSpawnSuccess()
+
+      const { maybeBackgroundUpdate } = await import('./update-check')
+      maybeBackgroundUpdate('https://npm.example.com/')
+      await awaitNextTick()
+
+      expect(globalThis.fetch).toHaveBeenCalledTimes(2)
+      expect(mockSpawn).toHaveBeenCalledTimes(1)
+      const [, args] = mockSpawn.mock.calls[0]
+      expect(args[0]).toBe('install')
+      expect(args[1]).toBe('-g')
+      expect(String(args[2])).toMatch(/wcap-mcp-remote-0\.1\.38-wcap\.99-.*\.tgz$/)
+      expect(args).toContain('--prefer-online')
     })
 
     it('swallows registry network failures without spawning install', async () => {
@@ -230,6 +272,19 @@ describe('update-check', () => {
       const state = JSON.parse(stateRaw)
       expect(typeof state.lastCheckedAt).toBe('number')
       expect(Math.abs(state.lastCheckedAt - Date.now())).toBeLessThan(5_000)
+    })
+
+    it('skips when another process holds the update lock', async () => {
+      await fs.mkdir(path.join(tmpConfigDir, 'update-check.lock'), { recursive: true })
+      globalThis.fetch = makeFetchOk('0.1.38-wcap.99')
+      makeSpawnSuccess()
+
+      const { maybeBackgroundUpdate } = await import('./update-check')
+      maybeBackgroundUpdate('https://npm.example.com/')
+      await awaitNextTick()
+
+      expect(globalThis.fetch).not.toHaveBeenCalled()
+      expect(mockSpawn).not.toHaveBeenCalled()
     })
   })
 })

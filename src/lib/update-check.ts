@@ -7,9 +7,10 @@
  *     anything unexpected, the running proxy keeps working with the
  *     already-installed global binary.
  *   - When a newer version is available and the registry is reachable,
- *     run `npm install -g @wcap/mcp-remote@latest` in a detached child
- *     process. The new code only takes effect on the next Claude Desktop
- *     restart - the currently running process is never re-execed.
+ *     download the exact tarball from registry metadata and run
+ *     `npm install -g <downloaded tarball>` in a child process. The new
+ *     code only takes effect on the next Claude Desktop restart - the
+ *     currently running process is never re-execed.
  *   - Throttle to at most one check per 24h via a small state file in
  *     ~/.mcp-auth/last-update-check.json. Restarting Claude Desktop ten
  *     times in a row should not hammer Verdaccio.
@@ -30,6 +31,7 @@ const PACKAGE_NAME = '@wcap/mcp-remote'
 const REGISTRY_TIMEOUT_MS = 5_000
 const INSTALL_TIMEOUT_MS = 30_000
 const THROTTLE_WINDOW_MS = 24 * 60 * 60 * 1000
+const LOCK_STALE_MS = 2 * 60 * 1000
 
 interface UpdateCheckState {
   /** Unix ms of the last completed check (success OR silent failure). */
@@ -38,9 +40,22 @@ interface UpdateCheckState {
   lastSeenLatest?: string
 }
 
-function stateFilePath(): string {
+interface LatestPackage {
+  version: string
+  tarballUrl?: string
+}
+
+function baseConfigDir(): string {
   const baseConfigDir = process.env.MCP_REMOTE_CONFIG_DIR || path.join(os.homedir(), '.mcp-auth')
-  return path.join(baseConfigDir, 'last-update-check.json')
+  return baseConfigDir
+}
+
+function stateFilePath(): string {
+  return path.join(baseConfigDir(), 'last-update-check.json')
+}
+
+function lockDirPath(): string {
+  return path.join(baseConfigDir(), 'update-check.lock')
 }
 
 async function readState(): Promise<UpdateCheckState | null> {
@@ -66,7 +81,7 @@ async function writeState(state: UpdateCheckState): Promise<void> {
  * Resolve the latest published version from the configured npm registry.
  * Returns null on any failure (network, parse, non-200, missing field).
  */
-async function fetchLatestVersion(registry: string): Promise<string | null> {
+async function fetchLatestPackage(registry: string): Promise<LatestPackage | null> {
   const url = registry.replace(/\/+$/, '') + '/' + encodeURIComponent(PACKAGE_NAME).replace('%40', '@')
 
   const controller = new AbortController()
@@ -81,15 +96,87 @@ async function fetchLatestVersion(registry: string): Promise<string | null> {
       debugLog('update-check: registry returned non-2xx', { status: res.status })
       return null
     }
-    const body = (await res.json()) as { 'dist-tags'?: { latest?: string } }
+    const body = (await res.json()) as {
+      'dist-tags'?: { latest?: string }
+      versions?: Record<string, { dist?: { tarball?: string } }>
+    }
     const latest = body['dist-tags']?.latest
     if (typeof latest !== 'string' || !latest) {
       debugLog('update-check: registry response missing dist-tags.latest')
       return null
     }
-    return latest
+    const tarballUrl = body.versions?.[latest]?.dist?.tarball
+    return {
+      version: latest,
+      ...(typeof tarballUrl === 'string' && tarballUrl ? { tarballUrl } : {}),
+    }
   } catch (err) {
     debugLog('update-check: registry fetch failed', err)
+    return null
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+async function acquireUpdateLock(): Promise<(() => Promise<void>) | null> {
+  const lockPath = lockDirPath()
+  await fs.mkdir(path.dirname(lockPath), { recursive: true })
+
+  const tryAcquire = async (): Promise<boolean> => {
+    try {
+      await fs.mkdir(lockPath)
+      await fs.writeFile(path.join(lockPath, 'owner.json'), JSON.stringify({ pid: process.pid, createdAt: Date.now() }), 'utf8')
+      return true
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') {
+        debugLog('update-check: failed to acquire lock', err)
+      }
+      return false
+    }
+  }
+
+  if (!(await tryAcquire())) {
+    try {
+      const stat = await fs.stat(lockPath)
+      if (Date.now() - stat.mtimeMs > LOCK_STALE_MS) {
+        debugLog('update-check: removing stale lock')
+        await fs.rm(lockPath, { recursive: true, force: true })
+        if (!(await tryAcquire())) {
+          debugLog('update-check: another process holds updater lock')
+          return null
+        }
+      } else {
+        debugLog('update-check: another process holds updater lock')
+        return null
+      }
+    } catch (err) {
+      debugLog('update-check: failed while checking existing lock', err)
+      return null
+    }
+  }
+
+  return async () => {
+    await fs.rm(lockPath, { recursive: true, force: true }).catch((err) => {
+      debugLog('update-check: failed to release lock', err)
+    })
+  }
+}
+
+async function downloadTarball(tarballUrl: string, version: string): Promise<string | null> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), REGISTRY_TIMEOUT_MS)
+  try {
+    const res = await fetch(tarballUrl, { method: 'GET', signal: controller.signal })
+    if (!res.ok) {
+      debugLog('update-check: tarball download returned non-2xx', { status: res.status })
+      return null
+    }
+    const body = Buffer.from(await res.arrayBuffer())
+    const filePath = path.join(os.tmpdir(), `wcap-mcp-remote-${version}-${process.pid}-${Date.now()}.tgz`)
+    await fs.writeFile(filePath, body)
+    return filePath
+  } catch (err) {
+    debugLog('update-check: tarball download failed', err)
     return null
   } finally {
     clearTimeout(timer)
@@ -122,58 +209,63 @@ export function isNewerVersion(latest: string, current: string): boolean {
 }
 
 /**
- * Spawn `npm install -g @wcap/mcp-remote@latest` detached. We don't await
- * completion - the install can outlive the current process if needed.
- * stdout/stderr is captured for debug logging only, never surfaced.
+ * Spawn `npm install -g <target>`. The caller runs this in the background
+ * update chain, not on the proxy startup path.
  */
-function spawnBackgroundInstall(registry: string, fromVersion: string, toVersion: string): void {
-  const args = ['install', '-g', `${PACKAGE_NAME}@${toVersion}`, '--registry', registry]
+function spawnBackgroundInstall(registry: string, fromVersion: string, toVersion: string, installTarget: string): Promise<void> {
+  const args = ['install', '-g', installTarget, '--registry', registry, '--prefer-online']
   debugLog('update-check: spawning background install', { args })
 
-  let child
-  try {
-    child = spawn('npm', args, {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      detached: false,
-      shell: process.platform === 'win32',
-      windowsHide: true,
-    })
-  } catch (err) {
-    debugLog('update-check: spawn npm failed', err)
-    return
-  }
-
-  const stdoutChunks: Buffer[] = []
-  const stderrChunks: Buffer[] = []
-  child.stdout?.on('data', (chunk: Buffer) => stdoutChunks.push(chunk))
-  child.stderr?.on('data', (chunk: Buffer) => stderrChunks.push(chunk))
-
-  const killTimer = setTimeout(() => {
-    debugLog('update-check: install exceeded timeout, killing')
+  return new Promise((resolve) => {
+    let child
     try {
-      child.kill()
+      child = spawn('npm', args, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        detached: false,
+        shell: process.platform === 'win32',
+        windowsHide: true,
+      })
     } catch (err) {
-      debugLog('update-check: kill failed', err)
+      debugLog('update-check: spawn npm failed', err)
+      resolve()
+      return
     }
-  }, INSTALL_TIMEOUT_MS)
 
-  child.on('error', (err) => {
-    debugLog('update-check: install child errored', err)
-  })
+    const stdoutChunks: Buffer[] = []
+    const stderrChunks: Buffer[] = []
+    child.stdout?.on('data', (chunk: Buffer) => stdoutChunks.push(chunk))
+    child.stderr?.on('data', (chunk: Buffer) => stderrChunks.push(chunk))
 
-  child.on('exit', (code, signal) => {
-    clearTimeout(killTimer)
-    const stdout = Buffer.concat(stdoutChunks).toString('utf8')
-    const stderr = Buffer.concat(stderrChunks).toString('utf8')
-    if (code === 0) {
-      log(
-        `Background update installed: ${fromVersion} -> ${toVersion}. ` +
-          `Restart Claude Desktop to use the new version.`,
-      )
-      debugLog('update-check: install succeeded', { stdout, stderr })
-    } else {
-      debugLog('update-check: install failed', { code, signal, stdout, stderr })
-    }
+    const killTimer = setTimeout(() => {
+      debugLog('update-check: install exceeded timeout, killing')
+      try {
+        child.kill()
+      } catch (err) {
+        debugLog('update-check: kill failed', err)
+      }
+    }, INSTALL_TIMEOUT_MS)
+
+    child.on('error', (err) => {
+      clearTimeout(killTimer)
+      debugLog('update-check: install child errored', err)
+      resolve()
+    })
+
+    child.on('exit', (code, signal) => {
+      clearTimeout(killTimer)
+      const stdout = Buffer.concat(stdoutChunks).toString('utf8')
+      const stderr = Buffer.concat(stderrChunks).toString('utf8')
+      if (code === 0) {
+        log(
+          `Background update installed: ${fromVersion} -> ${toVersion}. ` +
+            `Restart Claude Desktop to use the new version.`,
+        )
+        debugLog('update-check: install succeeded', { stdout, stderr })
+      } else {
+        debugLog('update-check: install failed', { code, signal, stdout, stderr })
+      }
+      resolve()
+    })
   })
 }
 
@@ -198,31 +290,50 @@ export function maybeBackgroundUpdate(registry: string): void {
 }
 
 async function runCheck(registry: string): Promise<void> {
-  const now = Date.now()
-  const state = await readState()
-  if (state && now - state.lastCheckedAt < THROTTLE_WINDOW_MS) {
-    debugLog('update-check: skipped, within throttle window', {
-      lastCheckedAt: state.lastCheckedAt,
-      ageMs: now - state.lastCheckedAt,
-    })
-    return
+  const releaseLock = await acquireUpdateLock()
+  if (!releaseLock) return
+
+  let downloadedTarball: string | null = null
+  try {
+    const now = Date.now()
+    const state = await readState()
+    if (state && now - state.lastCheckedAt < THROTTLE_WINDOW_MS) {
+      debugLog('update-check: skipped, within throttle window', {
+        lastCheckedAt: state.lastCheckedAt,
+        ageMs: now - state.lastCheckedAt,
+      })
+      return
+    }
+
+    const latestPackage = await fetchLatestPackage(registry)
+    const latest = latestPackage?.version
+    // Always persist the check timestamp even on failure so we don't retry
+    // every 30s when the registry is briefly down.
+    await writeState({ lastCheckedAt: now, lastSeenLatest: latest || state?.lastSeenLatest })
+
+    if (!latest) {
+      debugLog('update-check: no latest version resolved; staying on', { current: MCP_REMOTE_VERSION })
+      return
+    }
+
+    if (!isNewerVersion(latest, MCP_REMOTE_VERSION)) {
+      debugLog('update-check: already on latest', { current: MCP_REMOTE_VERSION, latest })
+      return
+    }
+
+    debugLog('update-check: newer version available', { current: MCP_REMOTE_VERSION, latest })
+    if (latestPackage.tarballUrl) {
+      downloadedTarball = await downloadTarball(latestPackage.tarballUrl, latest)
+    }
+
+    const installTarget = downloadedTarball || `${PACKAGE_NAME}@${latest}`
+    await spawnBackgroundInstall(registry, MCP_REMOTE_VERSION, latest, installTarget)
+  } finally {
+    if (downloadedTarball) {
+      await fs.unlink(downloadedTarball).catch((err) => {
+        debugLog('update-check: failed to remove downloaded tarball', err)
+      })
+    }
+    await releaseLock()
   }
-
-  const latest = await fetchLatestVersion(registry)
-  // Always persist the check timestamp even on failure so we don't retry
-  // every 30s when the registry is briefly down.
-  await writeState({ lastCheckedAt: now, lastSeenLatest: latest || state?.lastSeenLatest })
-
-  if (!latest) {
-    debugLog('update-check: no latest version resolved; staying on', { current: MCP_REMOTE_VERSION })
-    return
-  }
-
-  if (!isNewerVersion(latest, MCP_REMOTE_VERSION)) {
-    debugLog('update-check: already on latest', { current: MCP_REMOTE_VERSION, latest })
-    return
-  }
-
-  debugLog('update-check: newer version available', { current: MCP_REMOTE_VERSION, latest })
-  spawnBackgroundInstall(registry, MCP_REMOTE_VERSION, latest)
 }

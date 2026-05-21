@@ -49,6 +49,17 @@ async function runProxy(
   // Set up event emitter for auth flow
   const events = new EventEmitter()
 
+  // Fire-and-forget background update check. Start it before auth/connect so
+  // an older installed version can still discover a fixed release even if its
+  // MCP connection path is unhealthy. Disable with
+  // MCP_REMOTE_DISABLE_UPDATE_CHECK=1.
+  try {
+    const registry = process.env.MCP_REMOTE_UPDATE_REGISTRY || DEFAULT_UPDATE_REGISTRY
+    maybeBackgroundUpdate(registry)
+  } catch (err) {
+    debugLog('update-check: invocation threw (treated as no-op)', err)
+  }
+
   // Discover OAuth server info via Protected Resource Metadata (RFC 9728)
   // This probes the MCP server for WWW-Authenticate header and fetches PRM
   log('Discovering OAuth server configuration...')
@@ -186,16 +197,6 @@ async function runProxy(
     log('Local STDIO server running')
     log(`Proxy established successfully between local STDIO and remote ${remoteTransport.constructor.name}`)
     log('Press Ctrl+C to exit')
-
-    // Fire-and-forget background update check. Never throws; if the npm
-    // registry is unreachable, the proxy keeps running on the currently
-    // installed global binary. Disable with MCP_REMOTE_DISABLE_UPDATE_CHECK=1.
-    try {
-      const registry = process.env.MCP_REMOTE_UPDATE_REGISTRY || DEFAULT_UPDATE_REGISTRY
-      maybeBackgroundUpdate(registry)
-    } catch (err) {
-      debugLog('update-check: invocation threw (treated as no-op)', err)
-    }
 
     // Setup cleanup handler
     const cleanup = async () => {
