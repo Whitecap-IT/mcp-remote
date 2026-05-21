@@ -1,5 +1,6 @@
 import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import { log, debugLog } from './utils'
+import { isAuthFailureError } from './auth-errors'
 
 export type ReconnectionState = 'connected' | 'reconnecting' | 'waiting' | 'auth-failed'
 
@@ -27,21 +28,6 @@ export const DEFAULT_RECONNECTION_CONFIG: ReconnectionConfig = {
   waitingRetryIntervalMs: 5 * 60 * 1000,
   maxMessageAgeMs: 30 * 1000,
   maxAuthFailuresBeforeGiveUp: 5,
-}
-
-function isAuthError(err: unknown): boolean {
-  if (!err) return false
-  const e = err as { message?: string; errorCode?: string; status?: number }
-  const msg = (e.message || '').toLowerCase()
-  return (
-    e.status === 401 ||
-    e.status === 403 ||
-    e.errorCode === 'invalid_grant' ||
-    msg.includes('unauthorized') ||
-    msg.includes('invalid_grant') ||
-    msg.includes('authentication required') ||
-    msg.includes('invalid_token')
-  )
 }
 
 type JSONRPCMessage = any
@@ -138,10 +124,7 @@ export class ReconnectionManager {
 
       let delay: number
       if (this.retryCount <= this.config.maxRetriesBeforeWaiting) {
-        delay = Math.min(
-          this.config.initialDelayMs * Math.pow(this.config.backoffFactor, this.retryCount - 1),
-          this.config.maxDelayMs,
-        )
+        delay = Math.min(this.config.initialDelayMs * Math.pow(this.config.backoffFactor, this.retryCount - 1), this.config.maxDelayMs)
         log(`Reconnection attempt ${this.retryCount}/${this.config.maxRetriesBeforeWaiting} in ${delay}ms...`)
       } else {
         if (this.state !== 'waiting') {
@@ -194,16 +177,13 @@ export class ReconnectionManager {
         // credentials forever just churns silently. After
         // maxAuthFailuresBeforeGiveUp consecutive auth errors, surface a
         // clear terminal message and stop retrying.
-        if (isAuthError(error)) {
+        if (isAuthFailureError(error)) {
           this.consecutiveAuthFailures++
           debugLog('Auth-related reconnection failure', {
             consecutiveAuthFailures: this.consecutiveAuthFailures,
             limit: this.config.maxAuthFailuresBeforeGiveUp,
           })
-          if (
-            this.config.maxAuthFailuresBeforeGiveUp > 0 &&
-            this.consecutiveAuthFailures >= this.config.maxAuthFailuresBeforeGiveUp
-          ) {
+          if (this.config.maxAuthFailuresBeforeGiveUp > 0 && this.consecutiveAuthFailures >= this.config.maxAuthFailuresBeforeGiveUp) {
             this.state = 'auth-failed'
             this.reconnecting = false
             log(

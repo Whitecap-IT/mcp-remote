@@ -42,6 +42,7 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
 
   afterEach(() => {
     vi.clearAllMocks()
+    vi.unstubAllGlobals()
   })
 
   describe('scope priority', () => {
@@ -347,6 +348,48 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
 
       const got = await provider.tokens()
       expect(got?.access_token).toBe('new')
+    })
+
+    it('tokens() clears cached tokens when proactive refresh gets invalid_grant', async () => {
+      provider = new NodeOAuthClientProvider({
+        ...defaultOptions,
+        staticOAuthClientInfo: {
+          client_id: 'mcp-platform-prod',
+          redirect_uris: ['http://localhost:8080/oauth/callback'],
+        } as any,
+        authorizationServerMetadata: {
+          issuer: 'https://idp.example.com',
+          authorization_endpoint: 'https://idp.example.com/auth',
+          token_endpoint: 'https://idp.example.com/token',
+          response_types_supported: ['code'],
+        } as any,
+      })
+
+      mockReadJsonFile.mockResolvedValue({
+        access_token: 'expired-access-token',
+        token_type: 'Bearer',
+        refresh_token: 'stale-refresh-token',
+        expires_in: 3600,
+        expires_at: Date.now() - 1_000,
+      })
+
+      vi.stubGlobal(
+        'fetch',
+        vi.fn().mockResolvedValue(
+          new Response(
+            JSON.stringify({
+              error: 'invalid_grant',
+              error_description: "Session doesn't have required client",
+            }),
+            { status: 400 },
+          ),
+        ),
+      )
+
+      const got = await provider.tokens()
+
+      expect(got).toBeUndefined()
+      expect(mockDeleteConfigFile).toHaveBeenCalledWith('test-hash', 'tokens.json')
     })
 
     it('redirectToAuthorization suppresses repeat browser opens inside the cooldown', async () => {

@@ -8,6 +8,7 @@ import { log, debugLog, setupOAuthCallbackServerWithLongPoll } from './utils'
 
 export type AuthCoordinator = {
   initializeAuth: () => Promise<{ server: Server; waitForAuthCode: () => Promise<string>; skipBrowserAuth: boolean }>
+  resetAuth: () => Promise<void>
 }
 
 /**
@@ -151,6 +152,26 @@ export function createLazyAuthCoordinator(
       authState = await coordinateAuth(serverUrlHash, callbackPort, events, authTimeoutMs)
       debugLog('Auth coordination completed', { skipBrowserAuth: authState.skipBrowserAuth })
       return authState
+    },
+    resetAuth: async () => {
+      if (authState) {
+        debugLog('Resetting cached auth coordinator state')
+        await new Promise<void>((resolve) => {
+          authState?.server.close((error?: Error) => {
+            if (error) {
+              debugLog('Error closing OAuth callback server during auth reset', error)
+            }
+            resolve()
+          })
+        })
+        authState = null
+      }
+
+      try {
+        await deleteLockfile(serverUrlHash)
+      } catch (error) {
+        debugLog('Error deleting lockfile during auth reset', error)
+      }
     },
   }
 }

@@ -15,6 +15,7 @@ import { sanitizeUrl } from 'strict-url-sanitise'
 import { randomUUID } from 'node:crypto'
 import { fetchAuthorizationServerMetadata, type AuthorizationServerMetadata } from './authorization-server-metadata'
 import type { ProtectedResourceMetadata } from './protected-resource-metadata'
+import { isInvalidGrantError } from './auth-errors'
 
 // Extend the SDK's OAuthTokensSchema with `expires_at` — the absolute
 // expiration timestamp that saveTokens() writes. The SDK's schema uses
@@ -413,9 +414,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     // expires_at) and have a refresh_token. We refresh when the token is
     // already expired OR will expire within REFRESH_BUFFER_MS.
     const shouldProactivelyRefresh =
-      hasAuthoritativeExpiry &&
-      !!tokens.refresh_token &&
-      timeLeftMs < NodeOAuthClientProvider.REFRESH_BUFFER_MS
+      hasAuthoritativeExpiry && !!tokens.refresh_token && timeLeftMs < NodeOAuthClientProvider.REFRESH_BUFFER_MS
 
     if (!shouldProactivelyRefresh) {
       return tokens
@@ -451,6 +450,12 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
       // Refresh skipped (no metadata / no client info) - return stale tokens.
       return tokens
     } catch (err) {
+      if (isInvalidGrantError(err)) {
+        log('Refresh token was rejected by the authorization server. Clearing cached tokens and starting fresh auth.')
+        await this.invalidateCredentials('tokens')
+        return undefined
+      }
+
       // Refresh failed. Fall back to returning the stale tokens so the SDK's
       // existing 401 -> re-auth path can run. This preserves the prior
       // (reactive-only) behavior as a safety net.
@@ -621,6 +626,9 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
           deleteConfigFile(this.serverUrlHash, 'code_verifier.txt'),
         ])
         this._clientInfo = undefined
+        this.inMemoryTokens = null
+        this.refreshPromise = null
+        this.lastSuccessfulSaveAt = 0
         debugLog('All credentials invalidated')
         break
 
@@ -632,6 +640,9 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
 
       case 'tokens':
         await deleteConfigFile(this.serverUrlHash, 'tokens.json')
+        this.inMemoryTokens = null
+        this.refreshPromise = null
+        this.lastSuccessfulSaveAt = 0
         debugLog('OAuth tokens invalidated')
         break
 

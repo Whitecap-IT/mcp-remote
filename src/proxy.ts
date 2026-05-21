@@ -135,9 +135,12 @@ async function runProxy(
     // Set up reconnection manager for seamless server restarts.
     // Retries indefinitely — survives hours-long outages (e.g. weekend maintenance).
     const reconnectionManager = new ReconnectionManager({
+      config: {
+        maxMessageAgeMs: 4 * 60 * 1000,
+      },
       reconnectFn: async () => {
         log('Reconnecting to remote server...')
-        return connectToRemoteServer(null, serverUrl, authProvider, headers, authInitializer, transportStrategy, new Set(), true)
+        return connectToRemoteServer(null, serverUrl, authProvider, headers, authInitializer, transportStrategy)
       },
       onTransportReplaced: (newTransport) => {
         remoteTransport = newTransport
@@ -166,6 +169,10 @@ async function runProxy(
       transportToServer: remoteTransport,
       ignoredTools,
       reconnectionManager,
+      onAuthFailure: async () => {
+        await authProvider.invalidateCredentials('tokens')
+        await authCoordinator.resetAuth()
+      },
     })
 
     // Start the local STDIO server

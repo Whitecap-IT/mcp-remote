@@ -15,6 +15,7 @@ import {
 } from './protected-resource-metadata'
 import { fetchAuthorizationServerMetadata, type AuthorizationServerMetadata } from './authorization-server-metadata'
 import { ReconnectionManager } from './reconnection-manager'
+import { isAuthFailureError } from './auth-errors'
 import express from 'express'
 import net from 'net'
 import crypto from 'crypto'
@@ -152,15 +153,18 @@ export function mcpProxy({
   transportToServer,
   ignoredTools = [],
   reconnectionManager,
+  onAuthFailure,
 }: {
   transportToClient: Transport
   transportToServer: Transport
   ignoredTools?: string[]
   reconnectionManager?: ReconnectionManager
+  onAuthFailure?: (error: Error) => Promise<void>
 }) {
   let transportToClientClosed = false
   let transportToServerClosed = false
   let currentServerTransport = transportToServer
+  let authRecoveryInFlight = false
 
   const messageTransformer = createMessageTransformer({
     transformRequestFunction: (request: Message) => {
@@ -197,6 +201,32 @@ export function mcpProxy({
       return res
     },
   })
+
+  async function handleAuthFailure(error: Error, failedMessage?: Message) {
+    if (!reconnectionManager) {
+      onServerError(error)
+      return
+    }
+
+    if (failedMessage?.id) {
+      debugLog('Queueing message while refreshing OAuth credentials', { method: failedMessage.method, id: failedMessage.id })
+      reconnectionManager.queueMessage(failedMessage).catch(onServerError)
+    }
+
+    if (authRecoveryInFlight || reconnectionManager.isReconnecting()) {
+      debugLog('Auth recovery already in progress')
+      return
+    }
+
+    authRecoveryInFlight = true
+    try {
+      log('OAuth refresh failed. Clearing stale token state and starting browser re-auth if needed...')
+      await onAuthFailure?.(error)
+      await reconnectionManager.triggerReconnection(`auth failed: ${error.message}`)
+    } finally {
+      authRecoveryInFlight = false
+    }
+  }
 
   function wireServerTransportHandlers(serverTransport: Transport) {
     serverTransport.onmessage = (_message) => {
@@ -240,6 +270,11 @@ export function mcpProxy({
       debugLog('Error from remote server', { stack: error.stack })
 
       if (reconnectionManager && !reconnectionManager.isReconnecting()) {
+        if (isAuthFailureError(error)) {
+          handleAuthFailure(error).catch(onServerError)
+          return
+        }
+
         if (isReconnectableError(error)) {
           const code = error instanceof StreamableHTTPError ? error.code : 'unknown'
           debugLog('Reconnectable error detected, triggering reconnection', { code, message: error.message })
@@ -285,7 +320,7 @@ export function mcpProxy({
       }
     }
 
-    if (reconnectionManager && reconnectionManager.isReconnecting()) {
+    if (reconnectionManager && (reconnectionManager.isReconnecting() || authRecoveryInFlight)) {
       if (!message.id) {
         log(`Dropping notification during reconnection (${message.method})`)
         return
@@ -296,6 +331,11 @@ export function mcpProxy({
     }
 
     currentServerTransport.send(message).catch((error: Error) => {
+      if (reconnectionManager && isAuthFailureError(error)) {
+        handleAuthFailure(error, message).catch(onServerError)
+        return
+      }
+
       if (reconnectionManager && !reconnectionManager.isReconnecting()) {
         const isReconnectable = isReconnectableError(error)
 
@@ -640,7 +680,16 @@ export async function connectToRemoteServer(
         debugLog('Recursively reconnecting after auth', { recursionReasons: Array.from(recursionReasons) })
 
         // Recursively call connectToRemoteServer with the updated recursion tracking
-        return connectToRemoteServer(client, serverUrl, authProvider, headers, authInitializer, transportStrategy, recursionReasons, skipBrowserAuth)
+        return connectToRemoteServer(
+          client,
+          serverUrl,
+          authProvider,
+          headers,
+          authInitializer,
+          transportStrategy,
+          recursionReasons,
+          skipBrowserAuth,
+        )
       } catch (authError: any) {
         log('Authorization error:', authError)
         debugLog('Authorization error during finishAuth', {
@@ -669,7 +718,16 @@ export async function connectToRemoteServer(
           if (!recursionReasons.has(REASON_INVALID_GRANT)) {
             recursionReasons.add(REASON_INVALID_GRANT)
             log('Retrying with fresh authentication...')
-            return connectToRemoteServer(client, serverUrl, authProvider, headers, authInitializer, transportStrategy, recursionReasons, skipBrowserAuth)
+            return connectToRemoteServer(
+              client,
+              serverUrl,
+              authProvider,
+              headers,
+              authInitializer,
+              transportStrategy,
+              recursionReasons,
+              skipBrowserAuth,
+            )
           }
         }
 

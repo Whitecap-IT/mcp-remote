@@ -979,6 +979,59 @@ describe('Feature: MCP Proxy', () => {
       }),
     )
   })
+
+  it('Scenario: Recover from send-time invalid_grant by queueing request and triggering auth recovery', async () => {
+    const invalidGrant = Object.assign(new Error("Session doesn't have required client"), { name: 'InvalidGrantError' })
+    const mockTransportToClient = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    const mockTransportToServer = {
+      send: vi.fn().mockRejectedValue(invalidGrant),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    const reconnectionManager = {
+      isSyntheticInitResponse: vi.fn().mockReturnValue(false),
+      onTransportSwapped: vi.fn(),
+      isReconnecting: vi.fn().mockReturnValue(false),
+      triggerReconnection: vi.fn().mockResolvedValue(undefined),
+      queueMessage: vi.fn().mockResolvedValue(undefined),
+      captureInitialize: vi.fn(),
+    } as any
+    const onAuthFailure = vi.fn().mockResolvedValue(undefined)
+
+    mcpProxy({
+      transportToClient: mockTransportToClient,
+      transportToServer: mockTransportToServer,
+      ignoredTools: [],
+      reconnectionManager,
+      onAuthFailure,
+    })
+
+    const message = {
+      jsonrpc: '2.0' as const,
+      method: 'tools/call',
+      id: 'weekend-resume-call',
+      params: { name: 'whprod-ro_list_schemas', arguments: {} },
+    }
+
+    mockTransportToClient.onmessage?.(message)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(onAuthFailure).toHaveBeenCalledWith(invalidGrant)
+    expect(reconnectionManager.queueMessage).toHaveBeenCalledWith(message)
+    expect(reconnectionManager.triggerReconnection).toHaveBeenCalledWith(expect.stringContaining('auth failed'))
+  })
 })
 
 describe('setupOAuthCallbackServerWithLongPoll', () => {
