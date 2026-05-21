@@ -100,10 +100,13 @@ function makeSpawnSuccess(): ReturnType<typeof vi.fn> {
 }
 
 async function awaitNextTick() {
-  // The background chain is: setImmediate -> readState (async fs) ->
-  // fetchLatestVersion (async fetch) -> writeState (async fs mkdir + write) ->
-  // spawn. The fs operations involve multiple microtask hops, so flush
-  // generously.
+  // The background chain is: setTimeout(startupDelay) -> runCheck ->
+  // acquireUpdateLock -> readState -> fetchLatestPackage -> writeState ->
+  // (optional downloadTarball) -> spawnBackgroundInstall (Promise that the
+  // mocked child resolves on the next setImmediate). Tests force
+  // MCP_REMOTE_UPDATE_STARTUP_DELAY_MS=0 in beforeEach so we don't wait the
+  // full production delay on every test; the dedicated delay test below
+  // exercises the real wait path.
   for (let i = 0; i < 50; i++) {
     await new Promise((resolve) => setTimeout(resolve, 0))
   }
@@ -112,7 +115,11 @@ async function awaitNextTick() {
 describe('update-check', () => {
   beforeEach(async () => {
     tmpConfigDir = await fs.mkdtemp(path.join(os.tmpdir(), 'mcp-remote-update-test-'))
-    process.env = { ...ORIG_ENV, MCP_REMOTE_CONFIG_DIR: tmpConfigDir }
+    process.env = {
+      ...ORIG_ENV,
+      MCP_REMOTE_CONFIG_DIR: tmpConfigDir,
+      MCP_REMOTE_UPDATE_STARTUP_DELAY_MS: '0',
+    }
     delete process.env.MCP_REMOTE_DISABLE_UPDATE_CHECK
     mockSpawn.mockReset()
     vi.resetModules()
@@ -157,6 +164,32 @@ describe('update-check', () => {
 
       expect(globalThis.fetch).not.toHaveBeenCalled()
       expect(mockSpawn).not.toHaveBeenCalled()
+    })
+
+    it('honors MCP_REMOTE_UPDATE_STARTUP_DELAY_MS - no work before delay elapses', async () => {
+      // 300 ms delay: just long enough to observe the gap without slowing
+      // the suite. The production default (5000) protects against
+      // throwaway processes; this test only verifies the gating mechanism.
+      process.env.MCP_REMOTE_UPDATE_STARTUP_DELAY_MS = '300'
+      globalThis.fetch = makeFetchOk('0.1.38-wcap.99')
+      makeSpawnSuccess()
+
+      const { maybeBackgroundUpdate } = await import('./update-check')
+      maybeBackgroundUpdate('https://npm.example.com/')
+
+      // Sample at 100ms - the delay should still be pending.
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      expect(globalThis.fetch).not.toHaveBeenCalled()
+      expect(mockSpawn).not.toHaveBeenCalled()
+
+      // Wait past the delay + a healthy slack for the fs/network chain.
+      await new Promise((resolve) => setTimeout(resolve, 500))
+      for (let i = 0; i < 50; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 0))
+      }
+
+      expect(globalThis.fetch).toHaveBeenCalledTimes(1)
+      expect(mockSpawn).toHaveBeenCalledTimes(1)
     })
 
     it('does not install when already on the latest version', async () => {

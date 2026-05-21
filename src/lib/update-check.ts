@@ -31,7 +31,25 @@ const PACKAGE_NAME = '@wcap/mcp-remote'
 const REGISTRY_TIMEOUT_MS = 5_000
 const INSTALL_TIMEOUT_MS = 30_000
 const THROTTLE_WINDOW_MS = 24 * 60 * 60 * 1000
-const LOCK_STALE_MS = 2 * 60 * 1000
+// Wait briefly before starting the update check so a process that Claude
+// Desktop spawns and immediately kills (config probe, port collision, quick
+// restart) never starts an `npm install -g`. Anything that survives 5
+// seconds is committed enough for us to consider updating its binary.
+// MCP_REMOTE_UPDATE_STARTUP_DELAY_MS overrides for tests / debugging.
+const DEFAULT_STARTUP_DELAY_MS = 5_000
+function startupDelayMs(): number {
+  const raw = process.env.MCP_REMOTE_UPDATE_STARTUP_DELAY_MS
+  if (!raw) return DEFAULT_STARTUP_DELAY_MS
+  const parsed = Number.parseInt(raw, 10)
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_STARTUP_DELAY_MS
+}
+// Stale lock window. Legitimate installs finish well within INSTALL_TIMEOUT_MS
+// (30s), but on Windows an AV scan of the tarball, npm's own retry-with-
+// backoff against a slow registry, or a contended global node_modules can
+// stretch a real install past 2 minutes. 10 minutes keeps a stuck process
+// from blocking forever while staying generous enough that we don't
+// misidentify a slow-but-healthy install as crashed and clobber it.
+const LOCK_STALE_MS = 10 * 60 * 1000
 
 interface UpdateCheckState {
   /** Unix ms of the last completed check (success OR silent failure). */
@@ -280,13 +298,22 @@ export function maybeBackgroundUpdate(registry: string): void {
     return
   }
 
-  // setImmediate + .catch to make sure nothing about this code path can
-  // unhandled-reject during the proxy's startup.
-  setImmediate(() => {
+  // setTimeout (not setImmediate) + .catch so this code path can never
+  // unhandled-reject. The STARTUP_DELAY_MS pause is the key behavior change
+  // over wcap.18: if Claude Desktop SIGKILLs the mcp-remote process within
+  // 5 seconds (which is its usual probe-then-kill pattern on misconfigured
+  // servers, port conflicts, or restarts), the timer fires inside an
+  // already-dead process and the timer reference is harmlessly GC'd. No
+  // global `npm install -g` ever starts for a throwaway process.
+  const timer = setTimeout(() => {
     runCheck(registry).catch((err) => {
       debugLog('update-check: top-level catch (this is a bug)', err)
     })
-  })
+  }, startupDelayMs())
+  // Don't let a pending update timer keep the Node event loop alive: if the
+  // proxy's own cleanup path has decided we're done, the timer should not
+  // delay process exit.
+  if (typeof timer.unref === 'function') timer.unref()
 }
 
 async function runCheck(registry: string): Promise<void> {
