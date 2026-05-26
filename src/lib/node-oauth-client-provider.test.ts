@@ -450,6 +450,50 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
       expect(openMock).toHaveBeenCalledTimes(1)
     })
 
+    it('redirectToAuthorization opens only once for duplicate calls with the same active challenge', async () => {
+      const openMod = await import('open')
+      const openMock = vi.mocked(openMod.default)
+      openMock.mockClear()
+
+      provider = new NodeOAuthClientProvider(defaultOptions)
+      provider.state()
+      await provider.saveCodeVerifier('verifier-A-1234567890abcdef')
+
+      const { createHash } = await import('node:crypto')
+      const challenge = createHash('sha256').update('verifier-A-1234567890abcdef').digest('base64url')
+      const url = new URL('https://idp.example.com/auth')
+      url.searchParams.set('code_challenge', challenge)
+
+      await provider.redirectToAuthorization(url)
+      await provider.redirectToAuthorization(url)
+      await provider.redirectToAuthorization(url)
+
+      expect(openMock).toHaveBeenCalledTimes(1)
+    })
+
+    it('redirectToAuthorization suppresses browser auth and unwinds when cached refresh token exists', async () => {
+      const openMod = await import('open')
+      const openMock = vi.mocked(openMod.default)
+      openMock.mockClear()
+
+      provider = new NodeOAuthClientProvider(defaultOptions)
+      mockReadJsonFile.mockResolvedValue({
+        access_token: 'expired-access-token',
+        token_type: 'Bearer',
+        refresh_token: 'offline-refresh-token',
+        expires_in: 3600,
+        expires_at: Date.now() - 60_000,
+      })
+
+      const url = new URL('https://idp.example.com/auth')
+      await expect(provider.redirectToAuthorization(url)).rejects.toMatchObject({
+        status: 401,
+        silentRetryAvailable: true,
+      })
+
+      expect(openMock).toHaveBeenCalledTimes(0)
+    })
+
     it('saveCodeVerifier is first-writer-wins within an active attempt', async () => {
       provider = new NodeOAuthClientProvider(defaultOptions)
       provider.state()
@@ -559,8 +603,14 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
         expires_in: 7200,
       })
 
-      await provider.redirectToAuthorization(url)
-      await provider.redirectToAuthorization(url)
+      await expect(provider.redirectToAuthorization(url)).rejects.toMatchObject({
+        status: 401,
+        silentRetryAvailable: true,
+      })
+      await expect(provider.redirectToAuthorization(url)).rejects.toMatchObject({
+        status: 401,
+        silentRetryAvailable: true,
+      })
 
       // Zero browser tabs — the "tokens just saved" guard catches everything.
       expect(openMock).toHaveBeenCalledTimes(0)

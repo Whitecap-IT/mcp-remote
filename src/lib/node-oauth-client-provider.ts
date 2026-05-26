@@ -1,6 +1,6 @@
 import open from 'open'
 import { z } from 'zod'
-import { OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js'
+import { OAuthClientProvider, UnauthorizedError } from '@modelcontextprotocol/sdk/client/auth.js'
 import {
   OAuthClientInformationFull,
   OAuthClientInformationFullSchema,
@@ -87,6 +87,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     codeVerifier: string | null
     codeChallenge: string | null
     startedAt: number
+    browserOpenedAt?: number
   } | null = null
 
   // Backoff window after an invalid_grant terminal rejection. While set,
@@ -113,6 +114,8 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   // Refresh the access_token when it has this many ms left. 60 seconds gives
   // plenty of buffer to round-trip the refresh exchange before the SDK uses it.
   private static readonly REFRESH_BUFFER_MS = 60_000
+
+  private static readonly INTERACTIVE_AUTH_SUPPRESSION_BUFFER_MS = 5_000
 
   /**
    * Creates a new NodeOAuthClientProvider
@@ -205,6 +208,42 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     if (!this.activeAuthAttempt) return
     debugLog('Releasing OAuth attempt', { state: this.activeAuthAttempt.state, reason })
     this.activeAuthAttempt = null
+  }
+
+  private tokenHasUsableAccess(tokens: StoredOAuthTokens): boolean {
+    if (!tokens.access_token) return false
+    if (typeof tokens.expires_at === 'number' && tokens.expires_at > 0) {
+      return tokens.expires_at - Date.now() > NodeOAuthClientProvider.INTERACTIVE_AUTH_SUPPRESSION_BUFFER_MS
+    }
+    if (typeof tokens.expires_in === 'number') {
+      return tokens.expires_in > 0
+    }
+    // Some providers omit expiry on long-lived tokens. If we have an access
+    // token and no authoritative expiry, let the request prove whether it is
+    // still accepted instead of launching a browser preemptively.
+    return true
+  }
+
+  private async hasSilentAuthPath(): Promise<{ suppress: boolean; reason: string }> {
+    try {
+      const tokens = (await this.tokens()) as StoredOAuthTokens | undefined
+      if (!tokens?.access_token) {
+        return { suppress: false, reason: 'no cached access token' }
+      }
+
+      if (this.tokenHasUsableAccess(tokens)) {
+        return { suppress: true, reason: 'cached access token is still usable' }
+      }
+
+      if (tokens.refresh_token) {
+        return { suppress: true, reason: 'cached refresh token is available for silent retry' }
+      }
+
+      return { suppress: false, reason: 'cached access token expired and no refresh token exists' }
+    } catch (error) {
+      debugLog('Silent auth preflight failed; interactive auth may proceed', error)
+      return { suppress: false, reason: 'silent auth preflight failed' }
+    }
   }
 
   private static pkceChallengeForVerifier(verifier: string): string {
@@ -638,11 +677,21 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     authorizationUrl.searchParams.set('scope', effectiveScope)
     debugLog('Added scope parameter to authorization URL', { scopes: effectiveScope })
 
-    log(`\nPlease authorize this client by visiting:\n${authorizationUrl.toString()}\n`)
+    // Guard 1: cached tokens / refresh tokens. The SDK reaches
+    // redirectToAuthorization after it decides interactive auth may be needed,
+    // but in Claude Desktop reconnect storms that decision can be stale. Give
+    // the provider one last chance to use the cache or refresh silently before
+    // opening a popup.
+    const silentAuth = await this.hasSilentAuthPath()
+    if (silentAuth.suppress) {
+      log(`Browser open suppressed: ${silentAuth.reason}. Retrying with cached credentials instead of prompting.`)
+      throw Object.assign(new UnauthorizedError(`Silent auth retry available: ${silentAuth.reason}`), {
+        status: 401,
+        silentRetryAvailable: true,
+      })
+    }
 
-    debugLog('Redirecting to authorization URL', authorizationUrl.toString())
-
-    // Guard 1: recently saved tokens. If we just persisted fresh tokens
+    // Guard 2: recently saved tokens. If we just persisted fresh tokens
     // within AUTH_RECENT_WINDOW_MS, the SDK reaching this code path is
     // almost certainly a false alarm; our tokens are valid and the SDK can
     // retry the request with its existing Bearer header.
@@ -656,7 +705,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
       return
     }
 
-    // Guard 2: invalid_grant backoff. After a token-exchange failure we
+    // Guard 3: invalid_grant backoff. After a token-exchange failure we
     // refuse new OAuth round trips for an exponential window so we are not
     // spamming an IdP that just said "no".
     const backoffRemaining = this.invalidGrantBackoffUntil - Date.now()
@@ -668,7 +717,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
       return
     }
 
-    // Guard 3: PKCE challenge match. The single-flight gate guarantees
+    // Guard 4: PKCE challenge match. The single-flight gate guarantees
     // only one verifier is associated with the active attempt. If the URL
     // the SDK handed us was built with a DIFFERENT challenge, it came from
     // a duplicate auth pass that lost the race in saveCodeVerifier(). It is
@@ -686,7 +735,23 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
       return
     }
 
+    if (attempt?.browserOpenedAt) {
+      log('Auth tab already pending for this server; this duplicate attempt is suppressed.')
+      debugLog('Suppressing redirectToAuthorization because browser was already opened for active attempt', {
+        state: attempt.state,
+        openedAgeMs: Date.now() - attempt.browserOpenedAt,
+      })
+      return
+    }
+
+    log(`\nPlease authorize this client by visiting:\n${authorizationUrl.toString()}\n`)
+
+    debugLog('Redirecting to authorization URL', authorizationUrl.toString())
+
     try {
+      if (attempt) {
+        attempt.browserOpenedAt = Date.now()
+      }
       await open(sanitizeUrl(authorizationUrl.toString()))
       log('Browser opened automatically.')
     } catch (error) {

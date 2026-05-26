@@ -27,6 +27,7 @@ import { NodeOAuthClientProvider } from './lib/node-oauth-client-provider'
 import { createLazyAuthCoordinator } from './lib/coordination'
 import { ReconnectionManager } from './lib/reconnection-manager'
 import { maybeBackgroundUpdate } from './lib/update-check'
+import { isInvalidGrantError } from './lib/auth-errors'
 
 const DEFAULT_UPDATE_REGISTRY = 'https://npm.shakudo.wcap.ca/'
 
@@ -186,9 +187,16 @@ async function runProxy(
       transportToServer: remoteTransport,
       ignoredTools,
       reconnectionManager,
-      onAuthFailure: async () => {
-        await authProvider.invalidateCredentials('tokens')
-        await authCoordinator.resetAuth()
+      onAuthFailure: async (error) => {
+        if (isInvalidGrantError(error)) {
+          authProvider.recordInvalidGrant()
+          await authProvider.invalidateCredentials('tokens')
+          await authProvider.invalidateCredentials('verifier')
+          await authCoordinator.resetAuth()
+          return
+        }
+
+        log('Auth failure reported, but cached credentials were kept so reconnection can retry silent refresh first.')
       },
     })
 

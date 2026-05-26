@@ -7,7 +7,7 @@ export function isInvalidGrantError(err: unknown): boolean {
     e.errorCode === 'invalid_grant' ||
     e.name === 'InvalidGrantError' ||
     msg.includes('invalid_grant') ||
-    msg.includes("session doesn't have required client")
+    (msg.includes('session') && msg.includes('required client'))
   )
 }
 

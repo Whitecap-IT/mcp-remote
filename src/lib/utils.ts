@@ -33,6 +33,7 @@ declare global {
 // Connection constants
 export const REASON_AUTH_NEEDED = 'authentication-needed'
 export const REASON_TRANSPORT_FALLBACK = 'falling-back-to-alternate-transport'
+export const REASON_SILENT_AUTH_RETRY = 'silent-auth-retry'
 // 10 minutes covers slow MFA / hardware-token / multi-factor SSO flows
 // without leaving Claude Desktop frozen if the user closes the tab. Override
 // via OAuthCallbackServerOptions.browserAuthTimeoutMs.
@@ -98,6 +99,7 @@ export function log(str: string, ...rest: unknown[]) {
 type Message = any
 const MESSAGE_BLOCKED = Symbol('MessageBlocked')
 const isMessageBlocked = (value: any): value is typeof MESSAGE_BLOCKED => value === MESSAGE_BLOCKED
+const SILENT_AUTH_RETRY_BUFFER_MS = 5_000
 
 export function createMessageTransformer({
   transformRequestFunction,
@@ -136,15 +138,42 @@ function isReconnectableError(error: Error): boolean {
     return code === 400 || code === 404 || code === 500 || code === 502 || code === 503 || code === 504
   }
   const msg = error.message?.toLowerCase() ?? ''
+  // StreamableHTTPClientTransport already owns SSE stream resume/retry.
+  // Treating its "SSE stream disconnected" notification as an outer
+  // reconnect creates duplicate transports and can cascade into OAuth.
   return (
     msg.includes('connection refused') ||
     msg.includes('econnrefused') ||
     msg.includes('econnreset') ||
     msg.includes('socket hang up') ||
     msg.includes('network') ||
-    msg.includes('fetch failed') ||
-    msg.includes('sse stream disconnected')
+    msg.includes('fetch failed')
   )
+}
+
+async function hasCachedAuthForSilentRetry(authProvider: OAuthClientProvider): Promise<boolean> {
+  try {
+    const tokens = (await authProvider.tokens?.()) as
+      | {
+          access_token?: string
+          refresh_token?: string
+          expires_in?: number
+          expires_at?: number
+        }
+      | undefined
+    if (!tokens?.access_token) return false
+    if (tokens.refresh_token) return true
+    if (typeof tokens.expires_at === 'number' && tokens.expires_at > 0) {
+      return tokens.expires_at - Date.now() > SILENT_AUTH_RETRY_BUFFER_MS
+    }
+    if (typeof tokens.expires_in === 'number') {
+      return tokens.expires_in > 0
+    }
+    return true
+  } catch (error) {
+    debugLog('Cached auth check failed before interactive auth', error)
+    return false
+  }
 }
 
 /**
@@ -582,16 +611,6 @@ export async function connectToRemoteServer(
     } else {
       debugLog('Starting transport directly')
       await transport.start()
-      if (!sseTransport) {
-        // Extremely hacky, but we didn't actually send a request when calling transport.start() above, so we don't
-        // know if we're even talking to an HTTP server. But if we forced that now we'd get an error later saying that
-        // the client is already connected. So let's just create a one-off client to make a single request and figure
-        // out if we're actually talking to an HTTP server or not.
-        debugLog('Creating test transport for HTTP-only connection test')
-        const testTransport = new StreamableHTTPClientTransport(url, { authProvider, requestInit: { headers } })
-        const testClient = new Client({ name: 'mcp-remote-fallback-test', version: '0.0.0' }, { capabilities: {} })
-        await testClient.connect(testTransport)
-      }
     }
     log(`Connected to remote server using ${transport.constructor.name}`)
 
@@ -638,6 +657,32 @@ export async function connectToRemoteServer(
         skipBrowserAuth,
       )
     } else if (error instanceof UnauthorizedError || (error instanceof Error && error.message.includes('Unauthorized'))) {
+      const hasCachedAuth = await hasCachedAuthForSilentRetry(authProvider)
+      if (hasCachedAuth) {
+        if (!recursionReasons.has(REASON_SILENT_AUTH_RETRY)) {
+          recursionReasons.add(REASON_SILENT_AUTH_RETRY)
+          log('Authentication required, but cached credentials are present. Retrying once before interactive auth...')
+          return connectToRemoteServer(
+            client,
+            serverUrl,
+            authProvider,
+            headers,
+            authInitializer,
+            transportStrategy,
+            recursionReasons,
+            skipBrowserAuth,
+          )
+        }
+
+        throw Object.assign(
+          new UnauthorizedError(`Silent auth retry failed while cached credentials are still present: ${error.message}`),
+          {
+            status: 401,
+            silentRetryAvailable: true,
+          },
+        )
+      }
+
       if (skipBrowserAuth) {
         log('Authentication required during reconnection, but browser auth is disabled. Will retry.')
         throw new Error(`Authentication required during reconnection: ${error.message}`)
@@ -740,6 +785,9 @@ export async function connectToRemoteServer(
         if (isInvalidGrant) {
           log('OAuth grant was rejected. Clearing stale auth state and re-authenticating...')
           debugLog('Detected invalid_grant error, invalidating tokens, verifier, and callback server state')
+
+          const maybeRecordsInvalidGrant = authProvider as OAuthClientProvider & { recordInvalidGrant?: () => void }
+          maybeRecordsInvalidGrant.recordInvalidGrant?.()
 
           // Invalidate stale material from this auth attempt. A failed
           // authorization-code exchange can leave an old code/verifier/callback
@@ -932,10 +980,9 @@ export function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbackServe
       }
 
       timeout = setTimeout(() => {
-        const error = Object.assign(
-          new Error(`Browser authorization timed out after ${Math.round(browserAuthTimeoutMs / 1000)} seconds`),
-          { status: 401 },
-        )
+        const error = Object.assign(new Error(`Browser authorization timed out after ${Math.round(browserAuthTimeoutMs / 1000)} seconds`), {
+          status: 401,
+        })
         authError = error
         finish(() => reject(error))
       }, browserAuthTimeoutMs)
