@@ -141,11 +141,11 @@ Open this file to see connection status, reconnection attempts, and error detail
 
 ## Available Databases
 
-| Database | Description | Tool prefix |
-|----------|-------------|-------------|
-| whprod | Production warehouse | `whprod-ro_` |
-| whstage | Staging warehouse | `whstage-ro_` |
-| whgis | GIS database | `whgis-ro_` |
+| Database | Description          | Tool prefix   |
+| -------- | -------------------- | ------------- |
+| whprod   | Production warehouse | `whprod-ro_`  |
+| whstage  | Staging warehouse    | `whstage-ro_` |
+| whgis    | GIS database         | `whgis-ro_`   |
 
 All access is **read-only**. You can run SELECT queries but cannot modify data.
 
@@ -153,12 +153,12 @@ All access is **read-only**. You can run SELECT queries but cannot modify data.
 
 Your access depends on which Keycloak roles are assigned to your account:
 
-| Role | Access |
-|------|--------|
-| `mcp-ro-all` | All three databases (most common) |
-| `mcp-ro-whprod` | whprod only |
-| `mcp-ro-whstage` | whstage only |
-| `mcp-ro-whgis` | whgis only |
+| Role             | Access                            |
+| ---------------- | --------------------------------- |
+| `mcp-ro-all`     | All three databases (most common) |
+| `mcp-ro-whprod`  | whprod only                       |
+| `mcp-ro-whstage` | whstage only                      |
+| `mcp-ro-whgis`   | whgis only                        |
 
 If you get authorization errors for a specific database, contact your admin to verify your role assignment.
 

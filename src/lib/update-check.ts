@@ -274,10 +274,7 @@ function spawnBackgroundInstall(registry: string, fromVersion: string, toVersion
       const stdout = Buffer.concat(stdoutChunks).toString('utf8')
       const stderr = Buffer.concat(stderrChunks).toString('utf8')
       if (code === 0) {
-        log(
-          `Background update installed: ${fromVersion} -> ${toVersion}. ` +
-            `Restart Claude Desktop to use the new version.`,
-        )
+        log(`Background update installed: ${fromVersion} -> ${toVersion}. ` + `Restart Claude Desktop to use the new version.`)
         debugLog('update-check: install succeeded', { stdout, stderr })
       } else {
         debugLog('update-check: install failed', { code, signal, stdout, stderr })

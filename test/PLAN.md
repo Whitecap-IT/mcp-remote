@@ -60,14 +60,12 @@ This tests the **actual user flow**: spawning the proxy via CLI and communicatin
 To enable CI without secrets:
 
 1. **Hugging Face MCP Server** (`@huggingface/mcp-server`)
-
    - Public, no auth required
    - Provides tools for model/dataset search
    - SSE transport
    - Can be run locally via `npx`
 
 2. **Local Test Server** (custom)
-
    - Minimal Bun + `@hono/mcp` server
    - Controllable transport types (SSE-only, HTTP-only, both)
    - Controllable responses for error testing
@@ -83,7 +81,6 @@ To enable CI without secrets:
 Once basic tests pass:
 
 1. **OAuth Simulator** (custom, in-repo)
-
    - Minimal OAuth2 server for testing dynamic registration, token exchange, refresh
    - Controllable errors and timeouts
    - Runs locally in tests
@@ -211,14 +208,12 @@ test/e2e/
 ### Deliverables
 
 1. **Test Infrastructure**
-
    - [ ] Create `test/` directory structure
    - [ ] Add test script to package.json
    - [ ] Configure TypeScript for tests
    - [ ] Add test dependencies (vitest or node:test)
 
 2. **Minimal Test Server**
-
    - [ ] Implement local MCP server (Bun + @hono/mcp or Node.js)
    - [ ] Supports SSE and/or HTTP transports
    - [ ] Returns fixed tools/resources/prompts lists
@@ -227,7 +222,6 @@ test/e2e/
    - [ ] Start/stop from tests
 
 3. **Simple Test Client**
-
    - [ ] Spawns `mcp-remote` as subprocess with server URL
    - [ ] Connects via StdioClientTransport from MCP SDK
    - [ ] Requests tools/list, resources/list, prompts/list
@@ -235,7 +229,6 @@ test/e2e/
    - [ ] Handles cleanup (kill subprocess)
 
 4. **Basic E2E Test**
-
    - [ ] Build mcp-remote: `pnpm build`
    - [ ] Start local test server (get URL)
    - [ ] Spawn `node dist/proxy.js <url>` as stdio
@@ -265,7 +258,6 @@ test/e2e/
 ### Deliverables
 
 1. **OAuth Simulator**
-
    - [ ] Minimal OAuth2 server (registration, authorize, token, refresh endpoints)
    - [ ] Controllable errors and delays
    - [ ] In-process for fast tests
@@ -283,7 +275,6 @@ test/e2e/
 ### Deliverables
 
 1. **Full Test Matrix**
-
    - [ ] All CLI parsing scenarios
    - [ ] All transport fallback combinations
    - [ ] Multi-instance coordination
@@ -302,20 +293,17 @@ test/e2e/
 For comprehensive testing, we need servers that can:
 
 1. **Transport Variants**
-
    - SSE-only mode
    - HTTP-only mode
    - Both SSE and HTTP (for fallback testing)
 
 2. **Auth Variants**
-
    - No auth
    - OAuth with dynamic registration
    - OAuth with static client info
    - Auth errors (401, invalid tokens)
 
 3. **Response Control**
-
    - Fixed tools/resources lists
    - Error responses (500, schema violations)
    - Connection drops, timeouts
@@ -365,7 +353,6 @@ For comprehensive testing, we need servers that can:
 ### Phase 1b: Local Test Server
 
 1. Create minimal local test server
-
    - Bun + @hono/mcp or Node.js implementation
    - Controllable transport types (SSE-only, HTTP-only, both)
    - Fixed tools/resources/prompts lists

@@ -38,15 +38,15 @@ The storm should be impossible on `0.1.38-wcap.13`. If it still happens:
 
 Seven independent defenses, layered:
 
-| Defense | What it does |
-|---|---|
-| Race-safe token-file writes | `writeJsonFile` uses a UUID-suffixed temp file. Two concurrent writes inside one process no longer collide. |
-| Cross-process file lock (NEW in wcap.13) | `proper-lockfile` serializes writers across mcp-remote subprocesses. Eliminates the Windows-EPERM-on-rename noise even under heavy contention. |
-| Non-fatal save failures | If the disk write does fail (Windows antivirus, file locks, etc.), the tokens stay valid in memory and the auth flow doesn't restart. |
-| Cross-process refresh-token rotation handling | If another mcp-remote process consumed the refresh_token before us, we re-read the token file and retry once with the freshly-rotated value. |
-| Browser-open guards | After a successful token save, browser tabs are suppressed for 60s. Beyond that, a 30s cooldown prevents repeat opens. |
-| Auth-failure breakout (NEW in wcap.13) | After 5 consecutive auth failures during reconnect (refresh_token revoked, account disabled), surface a clear "auth permanently failed — clear ~/.mcp-auth and restart" message and stop retrying instead of looping silently every 5 min forever. |
-| Correct `expires_at` schema (NEW in wcap.13) | The persisted absolute-expiry timestamp now actually round-trips through the on-disk JSON. Earlier versions were silently stripping it on read, forcing fallback to the less-accurate `expires_in`. |
+| Defense                                       | What it does                                                                                                                                                                                                                                       |
+| --------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Race-safe token-file writes                   | `writeJsonFile` uses a UUID-suffixed temp file. Two concurrent writes inside one process no longer collide.                                                                                                                                        |
+| Cross-process file lock (NEW in wcap.13)      | `proper-lockfile` serializes writers across mcp-remote subprocesses. Eliminates the Windows-EPERM-on-rename noise even under heavy contention.                                                                                                     |
+| Non-fatal save failures                       | If the disk write does fail (Windows antivirus, file locks, etc.), the tokens stay valid in memory and the auth flow doesn't restart.                                                                                                              |
+| Cross-process refresh-token rotation handling | If another mcp-remote process consumed the refresh_token before us, we re-read the token file and retry once with the freshly-rotated value.                                                                                                       |
+| Browser-open guards                           | After a successful token save, browser tabs are suppressed for 60s. Beyond that, a 30s cooldown prevents repeat opens.                                                                                                                             |
+| Auth-failure breakout (NEW in wcap.13)        | After 5 consecutive auth failures during reconnect (refresh_token revoked, account disabled), surface a clear "auth permanently failed — clear ~/.mcp-auth and restart" message and stop retrying instead of looping silently every 5 min forever. |
+| Correct `expires_at` schema (NEW in wcap.13)  | The persisted absolute-expiry timestamp now actually round-trips through the on-disk JSON. Earlier versions were silently stripping it on read, forcing fallback to the less-accurate `expires_in`.                                                |
 
 All defenses are independent — if any one of them slips through, the next layer catches it.
 
