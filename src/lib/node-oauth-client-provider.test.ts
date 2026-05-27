@@ -8,6 +8,9 @@ vi.mock('./mcp-auth-config')
 vi.mock('./authorization-server-metadata', () => ({
   fetchAuthorizationServerMetadata: vi.fn().mockResolvedValue(undefined),
 }))
+vi.mock('./refresh-lock', () => ({
+  withRefreshLock: vi.fn(async (_serverUrlHash: string, fn: () => Promise<unknown>) => fn()),
+}))
 vi.mock('./utils', () => ({
   getServerUrlHash: () => 'test-hash',
   log: vi.fn(),
@@ -376,7 +379,7 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
       expect(got?.access_token).toBe('new')
     })
 
-    it('tokens() clears cached tokens when proactive refresh gets invalid_grant', async () => {
+    it('tokens() does not immediately clear cached tokens when proactive refresh gets invalid_grant', async () => {
       provider = new NodeOAuthClientProvider({
         ...defaultOptions,
         staticOAuthClientInfo: {
@@ -414,7 +417,65 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
 
       const got = await provider.tokens()
 
-      expect(got).toBeUndefined()
+      expect(got?.access_token).toBe('expired-access-token')
+      expect(mockDeleteConfigFile).not.toHaveBeenCalledWith('test-hash', 'tokens.json')
+    })
+
+    it('tokens() uses peer-refreshed disk tokens after acquiring the cross-process refresh lock', async () => {
+      const expired = {
+        access_token: 'expired-access-token',
+        token_type: 'Bearer',
+        refresh_token: 'old-refresh-token',
+        expires_in: 3600,
+        expires_at: Date.now() - 1_000,
+      }
+      const refreshedByPeer = {
+        access_token: 'peer-access-token',
+        token_type: 'Bearer',
+        refresh_token: 'peer-refresh-token',
+        expires_in: 3600,
+        expires_at: Date.now() + 3_600_000,
+      }
+
+      provider = new NodeOAuthClientProvider({
+        ...defaultOptions,
+        staticOAuthClientInfo: {
+          client_id: 'mcp-platform-prod',
+          redirect_uris: ['http://localhost:8080/oauth/callback'],
+        } as any,
+        authorizationServerMetadata: {
+          issuer: 'https://idp.example.com',
+          authorization_endpoint: 'https://idp.example.com/auth',
+          token_endpoint: 'https://idp.example.com/token',
+          response_types_supported: ['code'],
+        } as any,
+      })
+
+      mockReadJsonFile.mockResolvedValueOnce(expired).mockResolvedValueOnce(refreshedByPeer).mockResolvedValueOnce(refreshedByPeer)
+
+      const fetchMock = vi.fn()
+      vi.stubGlobal('fetch', fetchMock)
+
+      const got = await provider.tokens()
+
+      expect(got?.access_token).toBe('peer-access-token')
+      expect(fetchMock).not.toHaveBeenCalled()
+    })
+
+    it('invalidateCredentials suppresses first token wipe but clears on second failure in the window', async () => {
+      provider = new NodeOAuthClientProvider(defaultOptions)
+      mockReadJsonFile.mockResolvedValue({
+        access_token: 'expired-access-token',
+        token_type: 'Bearer',
+        refresh_token: 'stale-refresh-token',
+        expires_in: 3600,
+        expires_at: Date.now() - 1_000,
+      })
+
+      await provider.invalidateCredentials('tokens')
+      expect(mockDeleteConfigFile).not.toHaveBeenCalledWith('test-hash', 'tokens.json')
+
+      await provider.invalidateCredentials('tokens')
       expect(mockDeleteConfigFile).toHaveBeenCalledWith('test-hash', 'tokens.json')
     })
 

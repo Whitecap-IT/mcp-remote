@@ -16,6 +16,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { fetchAuthorizationServerMetadata, type AuthorizationServerMetadata } from './authorization-server-metadata'
 import type { ProtectedResourceMetadata } from './protected-resource-metadata'
 import { isInvalidGrantError } from './auth-errors'
+import { withRefreshLock } from './refresh-lock'
 
 // Extend the SDK's OAuthTokensSchema with `expires_at` — the absolute
 // expiration timestamp that saveTokens() writes. The SDK's schema uses
@@ -27,6 +28,13 @@ const StoredOAuthTokensSchema = OAuthTokensSchema.extend({
   expires_at: z.number().optional(),
 })
 type StoredOAuthTokens = z.infer<typeof StoredOAuthTokensSchema>
+
+function readPositiveIntegerEnv(name: string, fallback: number): number {
+  const raw = process.env[name]
+  if (!raw) return fallback
+  const parsed = Number.parseInt(raw, 10)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
+}
 
 /**
  * Implements the OAuthClientProvider interface for Node.js environments.
@@ -99,6 +107,10 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   private static readonly INVALID_GRANT_BACKOFF_BASE_MS = 2_000
   private static readonly INVALID_GRANT_BACKOFF_CAP_MS = 60_000
   private static readonly INVALID_GRANT_TERMINAL_THRESHOLD = 3
+  private tokenInvalidationWindowStartedAt = 0
+  private tokenInvalidationCount = 0
+  private static readonly TOKEN_INVALIDATION_WINDOW_MS = 60_000
+  private static readonly TOKEN_INVALIDATION_THRESHOLD = 2
 
   // Timestamp of the most recent successful saveTokens() call. If we just
   // got fresh tokens (either via OAuth flow or refresh_token exchange), any
@@ -108,7 +120,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   // an upstream that just lost in-memory session state) — suppressing a
   // browser tab in that window prevents the visible storm. The user's
   // tokens are valid; the SDK can retry with the existing Bearer header.
-  private static readonly AUTH_RECENT_WINDOW_MS = 60_000
+  private static readonly AUTH_RECENT_WINDOW_MS = readPositiveIntegerEnv('MCP_REMOTE_AUTH_RECENT_WINDOW_MS', 10 * 60_000)
   private lastSuccessfulSaveAt = 0
 
   // Refresh the access_token when it has this many ms left. 60 seconds gives
@@ -221,6 +233,15 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     // Some providers omit expiry on long-lived tokens. If we have an access
     // token and no authoritative expiry, let the request prove whether it is
     // still accepted instead of launching a browser preemptively.
+    return true
+  }
+
+  private tokenIsFreshEnoughForRefreshSkip(tokens: StoredOAuthTokens | undefined, previousExpiresAt?: number): boolean {
+    if (!tokens?.access_token) return false
+    if (typeof tokens.expires_at === 'number' && tokens.expires_at > 0) {
+      if (previousExpiresAt && tokens.expires_at > previousExpiresAt + 1_000) return true
+      return tokens.expires_at - Date.now() > NodeOAuthClientProvider.REFRESH_BUFFER_MS
+    }
     return true
   }
 
@@ -375,8 +396,27 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
    * once with the fresh value. If THAT also fails, the refresh token is
    * genuinely invalid and we surface the error.
    */
-  private async performTokenRefresh(refreshToken: string): Promise<OAuthTokens | undefined> {
-    return this.doTokenRefresh(refreshToken, /*allowReread=*/ true)
+  private async performTokenRefresh(tokensAtStart: StoredOAuthTokens): Promise<OAuthTokens | undefined> {
+    return withRefreshLock(this.serverUrlHash, async () => {
+      const latest = await readJsonFile<StoredOAuthTokens>(this.serverUrlHash, 'tokens.json', StoredOAuthTokensSchema)
+      if (this.tokenIsFreshEnoughForRefreshSkip(latest, tokensAtStart.expires_at)) {
+        log('Another mcp-remote process already refreshed tokens; using refreshed cache')
+        return latest
+      }
+
+      const refreshToken = latest?.refresh_token || tokensAtStart.refresh_token
+      if (!refreshToken) {
+        debugLog('Cannot refresh: no refresh_token after acquiring refresh lock')
+        return undefined
+      }
+
+      const newTokens = await this.doTokenRefresh(refreshToken, /*allowReread=*/ true)
+      if (newTokens) {
+        await this.saveTokens(newTokens)
+        return (await readJsonFile<StoredOAuthTokens>(this.serverUrlHash, 'tokens.json', StoredOAuthTokensSchema)) ?? newTokens
+      }
+      return undefined
+    })
   }
 
   private async doTokenRefresh(refreshToken: string, allowReread: boolean): Promise<OAuthTokens | undefined> {
@@ -542,14 +582,9 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     // Coalesce concurrent refresh attempts so multiple in-flight tokens()
     // callers share a single network round-trip.
     if (!this.refreshPromise) {
-      const refreshTokenValue = tokens.refresh_token!
       this.refreshPromise = (async () => {
         try {
-          const newTokens = await this.performTokenRefresh(refreshTokenValue)
-          if (newTokens) {
-            await this.saveTokens(newTokens)
-          }
-          return newTokens
+          return this.performTokenRefresh(tokens)
         } finally {
           // Allow subsequent near-expiry windows to trigger a fresh refresh.
           this.refreshPromise = null
@@ -572,7 +607,8 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
       if (isInvalidGrantError(err)) {
         log('Refresh token was rejected by the authorization server. Clearing cached tokens and starting fresh auth.')
         await this.invalidateCredentials('tokens')
-        return undefined
+        const latest = await readJsonFile<StoredOAuthTokens>(this.serverUrlHash, 'tokens.json', StoredOAuthTokensSchema)
+        return latest
       }
 
       // Refresh failed. Fall back to returning the stale tokens so the SDK's
@@ -614,6 +650,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
       expiresInValue: tokens.expires_in,
       expiresAt: expiresAt ? new Date(expiresAt).toISOString() : undefined,
     })
+    this.logGrantedScopes(tokens)
 
     // Store tokens with additional expires_at field for accurate expiration tracking
     const tokensWithExpiry = {
@@ -657,6 +694,23 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     this.releaseAuthAttempt('saveTokens-success')
     this.consecutiveInvalidGrants = 0
     this.invalidGrantBackoffUntil = 0
+    this.tokenInvalidationWindowStartedAt = 0
+    this.tokenInvalidationCount = 0
+  }
+
+  private logGrantedScopes(tokens: OAuthTokens): void {
+    const requestedScopes = this.getEffectiveScope()
+    const grantedScopeValue = (tokens as OAuthTokens & { scope?: string }).scope
+    const grantedScopes = typeof grantedScopeValue === 'string' ? grantedScopeValue.split(/\s+/).filter(Boolean) : []
+
+    debugLog('OAuth token scopes', {
+      requestedScopes,
+      grantedScopes: grantedScopes.length ? grantedScopes : undefined,
+    })
+
+    if (grantedScopes.length > 0 && !grantedScopes.includes('offline_access')) {
+      log('Warning: OAuth tokens were saved without offline_access scope. Silent refresh may expire with the Keycloak SSO session.')
+    }
   }
 
   /**
@@ -840,6 +894,8 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
         this.inMemoryTokens = null
         this.refreshPromise = null
         this.lastSuccessfulSaveAt = 0
+        this.tokenInvalidationWindowStartedAt = 0
+        this.tokenInvalidationCount = 0
         this.releaseAuthAttempt('invalidate-all')
         debugLog('All credentials invalidated')
         break
@@ -851,6 +907,10 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
         break
 
       case 'tokens':
+        if (await this.shouldSuppressTokenInvalidation()) {
+          debugLog('OAuth token invalidation suppressed')
+          break
+        }
         await deleteConfigFile(this.serverUrlHash, 'tokens.json')
         this.inMemoryTokens = null
         this.refreshPromise = null
@@ -871,5 +931,50 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
       default:
         throw new Error(`Unknown credential scope: ${scope}`)
     }
+  }
+
+  private async shouldSuppressTokenInvalidation(): Promise<boolean> {
+    const diskTokens = await readJsonFile<StoredOAuthTokens>(this.serverUrlHash, 'tokens.json', StoredOAuthTokensSchema)
+
+    if (!diskTokens && !this.inMemoryTokens) {
+      return false
+    }
+
+    if (this.inMemoryTokens && this.tokenIsFreshEnoughForRefreshSkip(diskTokens, this.inMemoryTokens.expires_at)) {
+      log('Token invalidation suppressed: another mcp-remote process refreshed tokens before this process could clear them.')
+      return true
+    }
+
+    const sinceSave = Date.now() - this.lastSuccessfulSaveAt
+    if (this.lastSuccessfulSaveAt > 0 && sinceSave < NodeOAuthClientProvider.AUTH_RECENT_WINDOW_MS) {
+      log(
+        `Token invalidation suppressed: tokens were saved ${sinceSave}ms ago (within ` +
+          `${NodeOAuthClientProvider.AUTH_RECENT_WINDOW_MS}ms window).`,
+      )
+      return true
+    }
+
+    const now = Date.now()
+    if (
+      !this.tokenInvalidationWindowStartedAt ||
+      now - this.tokenInvalidationWindowStartedAt > NodeOAuthClientProvider.TOKEN_INVALIDATION_WINDOW_MS
+    ) {
+      this.tokenInvalidationWindowStartedAt = now
+      this.tokenInvalidationCount = 0
+    }
+
+    this.tokenInvalidationCount += 1
+    if (this.tokenInvalidationCount < NodeOAuthClientProvider.TOKEN_INVALIDATION_THRESHOLD) {
+      log(
+        `Token invalidation suppressed after invalid_grant-like failure ` +
+          `(${this.tokenInvalidationCount}/${NodeOAuthClientProvider.TOKEN_INVALIDATION_THRESHOLD}). ` +
+          `A second failure in ${NodeOAuthClientProvider.TOKEN_INVALIDATION_WINDOW_MS / 1000}s will clear cached tokens.`,
+      )
+      return true
+    }
+
+    this.tokenInvalidationWindowStartedAt = 0
+    this.tokenInvalidationCount = 0
+    return false
   }
 }

@@ -361,3 +361,7 @@ async function runCheck(registry: string): Promise<void> {
     await releaseLock()
   }
 }
+
+export async function runCheckForTests(registry: string): Promise<void> {
+  await runCheck(registry)
+}

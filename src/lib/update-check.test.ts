@@ -196,9 +196,8 @@ describe('update-check', () => {
       globalThis.fetch = makeFetchOk(CURRENT_VERSION)
       makeSpawnSuccess()
 
-      const { maybeBackgroundUpdate } = await import('./update-check')
-      maybeBackgroundUpdate('https://npm.example.com/')
-      await awaitNextTick()
+      const { runCheckForTests } = await import('./update-check')
+      await runCheckForTests('https://npm.example.com/')
 
       expect(globalThis.fetch).toHaveBeenCalledTimes(1)
       expect(mockSpawn).not.toHaveBeenCalled()
@@ -208,9 +207,8 @@ describe('update-check', () => {
       globalThis.fetch = makeFetchOk('0.1.38-wcap.99')
       makeSpawnSuccess()
 
-      const { maybeBackgroundUpdate } = await import('./update-check')
-      maybeBackgroundUpdate('https://npm.example.com/')
-      await awaitNextTick()
+      const { runCheckForTests } = await import('./update-check')
+      await runCheckForTests('https://npm.example.com/')
 
       expect(mockSpawn).toHaveBeenCalledTimes(1)
       const [cmd, args] = mockSpawn.mock.calls[0]
@@ -229,9 +227,8 @@ describe('update-check', () => {
       globalThis.fetch = makeFetchOkWithTarball('0.1.38-wcap.99')
       makeSpawnSuccess()
 
-      const { maybeBackgroundUpdate } = await import('./update-check')
-      maybeBackgroundUpdate('https://npm.example.com/')
-      await awaitNextTick()
+      const { runCheckForTests } = await import('./update-check')
+      await runCheckForTests('https://npm.example.com/')
 
       expect(globalThis.fetch).toHaveBeenCalledTimes(2)
       expect(mockSpawn).toHaveBeenCalledTimes(1)
@@ -246,9 +243,8 @@ describe('update-check', () => {
       globalThis.fetch = makeFetchFail()
       makeSpawnSuccess()
 
-      const { maybeBackgroundUpdate } = await import('./update-check')
-      maybeBackgroundUpdate('https://npm.example.com/')
-      await awaitNextTick()
+      const { runCheckForTests } = await import('./update-check')
+      await runCheckForTests('https://npm.example.com/')
 
       expect(mockSpawn).not.toHaveBeenCalled()
     })
@@ -257,9 +253,8 @@ describe('update-check', () => {
       globalThis.fetch = makeFetchStatus(503)
       makeSpawnSuccess()
 
-      const { maybeBackgroundUpdate } = await import('./update-check')
-      maybeBackgroundUpdate('https://npm.example.com/')
-      await awaitNextTick()
+      const { runCheckForTests } = await import('./update-check')
+      await runCheckForTests('https://npm.example.com/')
 
       expect(mockSpawn).not.toHaveBeenCalled()
     })
@@ -271,9 +266,8 @@ describe('update-check', () => {
       globalThis.fetch = makeFetchOk('0.1.38-wcap.99')
       makeSpawnSuccess()
 
-      const { maybeBackgroundUpdate } = await import('./update-check')
-      maybeBackgroundUpdate('https://npm.example.com/')
-      await awaitNextTick()
+      const { runCheckForTests } = await import('./update-check')
+      await runCheckForTests('https://npm.example.com/')
 
       expect(globalThis.fetch).not.toHaveBeenCalled()
       expect(mockSpawn).not.toHaveBeenCalled()
@@ -286,9 +280,8 @@ describe('update-check', () => {
       globalThis.fetch = makeFetchOk('0.1.38-wcap.99')
       makeSpawnSuccess()
 
-      const { maybeBackgroundUpdate } = await import('./update-check')
-      maybeBackgroundUpdate('https://npm.example.com/')
-      await awaitNextTick()
+      const { runCheckForTests } = await import('./update-check')
+      await runCheckForTests('https://npm.example.com/')
 
       expect(globalThis.fetch).toHaveBeenCalledTimes(1)
       expect(mockSpawn).toHaveBeenCalledTimes(1)
@@ -297,9 +290,8 @@ describe('update-check', () => {
     it('persists the throttle timestamp even on registry failure', async () => {
       globalThis.fetch = makeFetchFail()
 
-      const { maybeBackgroundUpdate } = await import('./update-check')
-      maybeBackgroundUpdate('https://npm.example.com/')
-      await awaitNextTick()
+      const { runCheckForTests } = await import('./update-check')
+      await runCheckForTests('https://npm.example.com/')
 
       const stateRaw = await fs.readFile(path.join(tmpConfigDir, 'last-update-check.json'), 'utf8')
       const state = JSON.parse(stateRaw)
@@ -312,9 +304,8 @@ describe('update-check', () => {
       globalThis.fetch = makeFetchOk('0.1.38-wcap.99')
       makeSpawnSuccess()
 
-      const { maybeBackgroundUpdate } = await import('./update-check')
-      maybeBackgroundUpdate('https://npm.example.com/')
-      await awaitNextTick()
+      const { runCheckForTests } = await import('./update-check')
+      await runCheckForTests('https://npm.example.com/')
 
       expect(globalThis.fetch).not.toHaveBeenCalled()
       expect(mockSpawn).not.toHaveBeenCalled()
